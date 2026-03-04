@@ -26,24 +26,15 @@
         "repo": "RetailPOS"
       }
     ],
+    "artifactName": "RetailPOS-Setup-${version}.${ext}",
     "mac": {
-      "target": [
-        "dmg",
-        "zip"
-      ],
+      "target": ["dmg", "zip"],
       "category": "public.app-category.finance"
     },
     "win": {
-      "target": [
-        "nsis",
-        "portable"
-      ]
+      "target": ["nsis"]
     },
-    "files": [
-      "dist/**/*",
-      "src/main.js",
-      "src/preload.js"
-    ]
+    "files": ["dist/**/*", "src/main.js", "src/preload.js", "src/sync.js"]
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.98.0",

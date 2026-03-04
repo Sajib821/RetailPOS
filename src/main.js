@@ -1,15 +1,36 @@
 // src/main.js — RetailPOS (Electron main process)
-// Includes: SQLite DB + IPC handlers + Supabase sync init + Reports fix + Auto-updater (GitHub Releases)
+// Fixes packaged error: Cannot find module './sync'
+// Includes: SQLite DB + IPC handlers + Supabase sync init + Reports fix + Auto-updater
 
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const { autoUpdater } = require('electron-updater');
-const sync = require('./sync');
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 
 let mainWindow;
 let db;
+
+// -------------------- Robust sync loader (dev + packaged) --------------------
+let sync = {
+  init: () => {},
+  syncSale: async () => {},
+  syncInventory: async () => {},
+  testConnection: async () => false,
+};
+
+try {
+  // Dev: __dirname == .../src  -> ./sync works
+  // Packaged (sometimes): main.js at app root -> ./sync may NOT exist
+  sync = require(path.join(__dirname, 'sync'));
+} catch (e1) {
+  try {
+    // Packaged fallback: sync is usually inside /src in app.asar
+    sync = require(path.join(__dirname, 'src', 'sync'));
+  } catch (e2) {
+    console.warn('[Sync] sync module not found; app will run offline only.');
+  }
+}
 
 // -------------------- Window --------------------
 function createWindow() {
@@ -39,7 +60,6 @@ function createWindow() {
 
 // -------------------- Auto Update (GitHub Releases) --------------------
 function initAutoUpdate() {
-  // Only run in packaged builds
   autoUpdater.autoDownload = true;
 
   autoUpdater.on('update-downloaded', async () => {
@@ -49,7 +69,6 @@ function initAutoUpdate() {
       title: 'Update ready',
       message: 'A new version was downloaded. Restart to apply it.',
     });
-
     if (r.response === 0) autoUpdater.quitAndInstall();
   });
 
@@ -57,10 +76,6 @@ function initAutoUpdate() {
 }
 
 // -------------------- Safe Sync Helpers --------------------
-function canSync() {
-  return sync && typeof sync.init === 'function';
-}
-
 function safeSyncInventory(products) {
   if (!sync || typeof sync.syncInventory !== 'function') return;
   Promise.resolve(sync.syncInventory(products)).catch(() => {});
@@ -149,7 +164,6 @@ function initDB() {
     const ins = db.prepare(
       'INSERT INTO products (name,sku,category,price,cost,stock,low_stock_threshold) VALUES (?,?,?,?,?,?,?)'
     );
-
     [
       ['Wireless Earbuds Pro', 'SKU-001', 'Electronics', 79.99, 35, 45, 10],
       ['Cotton T-Shirt (M)', 'SKU-002', 'Clothing', 24.99, 8, 120, 20],
@@ -159,7 +173,6 @@ function initDB() {
     ].forEach((p) => ins.run(...p));
   }
 
-  // Init sync with saved credentials
   initSync();
 }
 
@@ -174,22 +187,17 @@ function initSync() {
   const storeId = (s.store_id || '').trim();
   const storeName = (s.store_name || '').trim();
 
-  if (!supabaseUrl || !supabaseKey) return;
-  if (!canSync()) return;
+  if (!supabaseUrl || !supabaseKey || !storeId) return;
+  if (!sync || typeof sync.init !== 'function') return;
 
   try {
-    sync.init({
-      supabaseUrl,
-      supabaseKey,
-      storeId,
-      storeName,
-    });
+    sync.init({ supabaseUrl, supabaseKey, storeId, storeName });
 
-    // Push current inventory on startup
+    // Push current inventory on startup (best-effort)
     const products = db.prepare('SELECT * FROM products').all();
     safeSyncInventory(products);
   } catch {
-    // ignore init errors (UI still works offline)
+    // ignore; app still works offline
   }
 }
 
@@ -198,14 +206,10 @@ app.whenReady().then(() => {
   createWindow();
   initDB();
 
-  if (app.isPackaged) {
-    initAutoUpdate();
-  }
+  if (app.isPackaged) initAutoUpdate();
 
   // ── Products ──────────────────────────────────────────────────────────────
-  ipcMain.handle('products:getAll', () => {
-    return db.prepare('SELECT * FROM products ORDER BY name').all();
-  });
+  ipcMain.handle('products:getAll', () => db.prepare('SELECT * FROM products ORDER BY name').all());
 
   ipcMain.handle('products:search', (_, q) => {
     const query = (q || '').trim();
@@ -248,9 +252,7 @@ app.whenReady().then(() => {
   });
 
   // ── Categories ────────────────────────────────────────────────────────────
-  ipcMain.handle('categories:getAll', () => {
-    return db.prepare('SELECT * FROM categories ORDER BY name').all();
-  });
+  ipcMain.handle('categories:getAll', () => db.prepare('SELECT * FROM categories ORDER BY name').all());
 
   ipcMain.handle('categories:create', (_, c) => {
     const r = db.prepare('INSERT OR IGNORE INTO categories (name,color) VALUES (?,?)').run(c.name, c.color);
@@ -279,14 +281,7 @@ app.whenReady().then(() => {
       const saleId = result.lastInsertRowid;
 
       items.forEach((item) => {
-        insertItem.run(
-          saleId,
-          item.product_id,
-          item.product_name,
-          item.quantity,
-          item.price,
-          item.subtotal
-        );
+        insertItem.run(saleId, item.product_id, item.product_name, item.quantity, item.price, item.subtotal);
         updateStock.run(item.quantity, item.product_id);
       });
 
@@ -305,15 +300,11 @@ app.whenReady().then(() => {
     return saleId;
   });
 
-  ipcMain.handle('sales:getAll', (_, { limit = 50, offset = 0 } = {}) => {
-    return db
-      .prepare('SELECT * FROM sales ORDER BY created_at DESC LIMIT ? OFFSET ?')
-      .all(limit, offset);
-  });
+  ipcMain.handle('sales:getAll', (_, { limit = 50, offset = 0 } = {}) =>
+    db.prepare('SELECT * FROM sales ORDER BY created_at DESC LIMIT ? OFFSET ?').all(limit, offset)
+  );
 
-  ipcMain.handle('sales:getItems', (_, id) => {
-    return db.prepare('SELECT * FROM sale_items WHERE sale_id=?').all(id);
-  });
+  ipcMain.handle('sales:getItems', (_, id) => db.prepare('SELECT * FROM sale_items WHERE sale_id=?').all(id));
 
   // ── Reports ───────────────────────────────────────────────────────────────
   ipcMain.handle('reports:summary', (_, { period = 'today' } = {}) => {
@@ -369,10 +360,10 @@ app.whenReady().then(() => {
       lowStock: db
         .prepare(
           `SELECT *
-          FROM products
-          WHERE stock <= low_stock_threshold
-          ORDER BY stock ASC
-          LIMIT 10`
+           FROM products
+           WHERE stock <= low_stock_threshold
+           ORDER BY stock ASC
+           LIMIT 10`
         )
         .all(),
     };
@@ -386,16 +377,11 @@ app.whenReady().then(() => {
 
   ipcMain.handle('settings:set', (_, { key, value }) => {
     db.prepare('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)').run(key, value);
-
-    // Re-init sync if cloud credentials changed
-    if (['supabase_url', 'supabase_key', 'store_id', 'store_name'].includes(key)) {
-      initSync();
-    }
-
+    if (['supabase_url', 'supabase_key', 'store_id', 'store_name'].includes(key)) initSync();
     return { ok: true };
   });
 
-  // ── Sync status ───────────────────────────────────────────────────────────
+  // ── Sync ──────────────────────────────────────────────────────────────────
   ipcMain.handle('sync:test', async () => {
     if (!sync || typeof sync.testConnection !== 'function') return false;
     try {
@@ -408,8 +394,12 @@ app.whenReady().then(() => {
   ipcMain.handle('sync:pushInventory', async () => {
     const products = db.prepare('SELECT * FROM products').all();
     if (!sync || typeof sync.syncInventory !== 'function') return false;
-    await sync.syncInventory(products);
-    return true;
+    try {
+      await sync.syncInventory(products);
+      return true;
+    } catch {
+      return false;
+    }
   });
 
   app.on('activate', () => {
@@ -424,7 +414,5 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   try {
     if (db) db.close();
-  } catch {
-    // ignore
-  }
+  } catch {}
 });
