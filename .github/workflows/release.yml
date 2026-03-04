@@ -1,4 +1,4 @@
-name: Release (Windows)
+name: Release (Windows + Mac)
 
 on:
   push:
@@ -10,14 +10,30 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
+
       - run: npm ci
-      - run: npx electron-builder --win --publish always
+
+      - name: Build and publish
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            npx electron-builder --win --publish always
+          else
+            npx electron-builder --mac --publish always
+          fi
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
