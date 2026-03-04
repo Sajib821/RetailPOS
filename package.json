@@ -1,0 +1,54 @@
+{
+  "name": "retail-pos",
+  "version": "1.0.0",
+  "description": "Offline Retail POS System for Mac & Windows",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "concurrently \"vite --port 3000\" \"wait-on http://localhost:3000 && electron .\"",
+    "build": "vite build && electron-builder",
+    "build:mac": "vite build && electron-builder --mac",
+    "build:win": "vite build && electron-builder --win"
+  },
+  "build": {
+    "appId": "com.retailpos.app",
+    "productName": "RetailPOS",
+    "directories": {
+      "output": "dist-app"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.finance"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "files": [
+      "dist/**/*",
+      "src/main.js",
+      "src/preload.js"
+    ]
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.98.0",
+    "better-sqlite3": "^9.4.3",
+    "electron-store": "^8.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "concurrently": "^8.2.2",
+    "electron": "^29.0.0",
+    "electron-builder": "^24.9.1",
+    "electron-rebuild": "^3.2.9",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "vite": "^5.1.4",
+    "wait-on": "^7.2.0"
+  }
+}
