@@ -1,6 +1,6 @@
 {
   "name": "retail-pos",
-  "version": "1.0.5",
+  "version": "1.0.4",
   "author": "Sajib Hasan",
   "description": "Offline Retail POS System for Mac & Windows",
   "main": "src/main.js",
@@ -28,23 +28,13 @@
     ],
     "artifactName": "RetailPOS-Setup-${version}.${ext}",
     "mac": {
-      "target": [
-        "dmg",
-        "zip"
-      ],
+      "target": ["dmg", "zip"],
       "category": "public.app-category.finance"
     },
     "win": {
-      "target": [
-        "nsis"
-      ]
+      "target": ["nsis"]
     },
-    "files": [
-      "dist/**/*",
-      "src/main.js",
-      "src/preload.js",
-      "src/sync.js"
-    ]
+    "files": ["dist/**/*", "src/**/*"]
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.98.0",
