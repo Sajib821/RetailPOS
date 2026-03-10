@@ -1,4 +1,4 @@
-name: Release (Windows)
+name: Release
 
 on:
   push:
@@ -22,14 +22,36 @@ jobs:
 
       - run: npm ci
 
-      # IMPORTANT: stop electron-builder from trying to publish by itself
       - run: npm run build:win -- --publish never
 
-      # Upload installer files to GitHub Release assets
-      - name: Upload Release Assets
+      - name: Upload Windows Release Assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.exe
             dist/*.blockmap
             dist/latest*.yml
+
+  build-mac:
+    runs-on: macos-latest
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build:mac -- --publish never
+
+      - name: Upload Mac Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.dmg
+            dist/*.zip
+            dist/latest-mac*.yml
