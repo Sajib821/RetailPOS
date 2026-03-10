@@ -1,6 +1,54 @@
 import { useState, useEffect } from 'react';
 import { usePOS } from '../App';
-import { Modal } from './Products';
+function Modal({ open, title, children, onClose }) {
+  if (!open) return null;
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.6)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 9999,
+      }}
+      onMouseDown={onClose}
+    >
+      <div
+        style={{
+          width: 520,
+          maxWidth: "92vw",
+          background: "var(--surface)",
+          border: "1px solid var(--border)",
+          borderRadius: 16,
+          padding: 16,
+          boxShadow: "var(--shadow)",
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <div style={{ fontWeight: 900, fontSize: 16 }}>{title}</div>
+          <button
+            onClick={onClose}
+            style={{
+              border: "1px solid var(--border)",
+              background: "transparent",
+              color: "var(--text2)",
+              fontWeight: 900,
+              borderRadius: 10,
+              padding: "6px 10px",
+              cursor: "pointer",
+            }}
+          >
+            Close
+          </button>
+        </div>
+        <div style={{ marginTop: 12 }}>{children}</div>
+      </div>
+    </div>
+  );
+}
 
 const fmt = (n) => `$${(Number(n) || 0).toFixed(2)}`;
 

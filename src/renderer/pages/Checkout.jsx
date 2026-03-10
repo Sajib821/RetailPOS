@@ -1,32 +1,34 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { usePOS } from "../App";
 
-const fmt = (n) => `$${(Number(n) || 0).toFixed(2)}`;
-
 export default function Checkout() {
   const { api, showToast, me } = usePOS();
 
-  // Data
+  const [storeName, setStoreName] = useState("RetailPOS");
+  const [storeContact, setStoreContact] = useState("");
+  const [receiptFooter, setReceiptFooter] = useState("");
+  const [currency, setCurrency] = useState("BDT");
+
+  const symbol =
+    currency === "BDT" ? "৳" : currency === "GBP" ? "£" : currency === "EUR" ? "€" : "$";
+  const fmt = (n) => `${symbol}${(Number(n) || 0).toFixed(2)}`;
+
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
 
-  // Cart + checkout
   const [cart, setCart] = useState([]);
   const [search, setSearch] = useState("");
   const [catFilter, setCatFilter] = useState("All");
-  const [payMethod, setPayMethod] = useState("cash");
-  const [discount, setDiscount] = useState("");
-  const [cashGiven, setCashGiven] = useState("");
+  const searchRef = useRef();
 
-  // Receipt modal
+  const [discount, setDiscount] = useState("");
+
+  const [payFocus, setPayFocus] = useState("cash");
+  const [payments, setPayments] = useState({ cash: "", card: "", cheque: "", other: "" });
+
   const [showReceipt, setShowReceipt] = useState(false);
   const [lastSale, setLastSale] = useState(null);
 
-  // Settings
-  const [storeName, setStoreName] = useState("RetailPOS");
-  const [receiptFooter, setReceiptFooter] = useState("");
-
-  // Customers
   const [customers, setCustomers] = useState([]);
   const [customerPanelOpen, setCustomerPanelOpen] = useState(false);
   const [customerSearch, setCustomerSearch] = useState("");
@@ -37,38 +39,29 @@ export default function Checkout() {
     phone: "",
     email: "",
     address: "",
-    code: "", // temporary "barcode/loyalty code" stored inside address
+    code: "",
   });
 
-  // Price correction popup
   const [priceEditItem, setPriceEditItem] = useState(null);
   const [priceEditValue, setPriceEditValue] = useState("");
 
-  const searchRef = useRef();
-
-  // ----- Temporary customer code storage inside address -----
   const CODE_RE = /\[\[CODE:([^\]]+)\]\]/i;
 
-  function extractCode(address) {
+  const extractCode = (address) => {
     const m = String(address || "").match(CODE_RE);
     return m ? String(m[1] || "").trim() : "";
-  }
+  };
 
-  function stripCode(address) {
-    return String(address || "")
-      .replace(CODE_RE, "")
-      .replace(/\n\s*\n/g, "\n")
-      .trim();
-  }
+  const stripCode = (address) =>
+    String(address || "").replace(CODE_RE, "").replace(/\n\s*\n/g, "\n").trim();
 
-  function encodeAddress(address, code) {
+  const encodeAddress = (address, code) => {
     const clean = stripCode(address);
     const c = String(code || "").trim();
     if (!c) return clean;
     return `${clean}\n[[CODE:${c}]]`.trim();
-  }
+  };
 
-  // ----- Loaders -----
   const reloadProducts = async () => {
     const p = await api.products.getAll();
     setProducts(p || []);
@@ -92,12 +85,13 @@ export default function Checkout() {
     reloadProducts();
     api.categories.getAll().then(setCategories);
 
-    // settings (safe even if missing, but your main.js must have settings:getAll handler)
     api.settings
       .getAll()
       .then((s) => {
         if (s?.store_name) setStoreName(s.store_name);
+        if (s?.contact !== undefined) setStoreContact(s.contact || "");
         if (s?.receipt_footer) setReceiptFooter(s.receipt_footer);
+        if (s?.currency) setCurrency(s.currency);
       })
       .catch(() => {});
 
@@ -119,7 +113,6 @@ export default function Checkout() {
     return matchCat && matchSearch && p.stock > 0;
   });
 
-  // ----- Price correction: DOES NOT change product DB price -----
   const getUnitPrice = (i) => Number(i.priceOverride ?? i.price) || 0;
 
   const openPriceEdit = (item) => {
@@ -129,23 +122,17 @@ export default function Checkout() {
 
   const applyPriceEdit = () => {
     const num = Number(priceEditValue);
-    if (!Number.isFinite(num) || num < 0) {
-      showToast("Invalid price", "error");
-      return;
-    }
-    setCart((prev) =>
-      prev.map((x) => (x.id === priceEditItem.id ? { ...x, priceOverride: num } : x))
-    );
+    if (!Number.isFinite(num) || num < 0) return showToast("Invalid price", "error");
+    setCart((prev) => prev.map((x) => (x.id === priceEditItem.id ? { ...x, priceOverride: num } : x)));
     setPriceEditItem(null);
-    showToast("Price updated (only for this sale)");
+    showToast("Price updated (only this sale)");
   };
 
   const resetPrice = (item) => {
     setCart((prev) => prev.map((x) => (x.id === item.id ? { ...x, priceOverride: null } : x)));
-    showToast("Price reset to original");
+    showToast("Price reset");
   };
 
-  // ----- Cart actions -----
   const addToCart = (product) => {
     setCart((prev) => {
       const existing = prev.find((i) => i.id === product.id);
@@ -161,18 +148,12 @@ export default function Checkout() {
   };
 
   const updateQty = (id, qty) => {
-    if (qty <= 0) {
-      setCart((prev) => prev.filter((i) => i.id !== id));
-      return;
-    }
-    setCart((prev) =>
-      prev.map((i) => (i.id === id ? { ...i, qty: Math.min(qty, i.stock) } : i))
-    );
+    if (qty <= 0) return setCart((prev) => prev.filter((i) => i.id !== id));
+    setCart((prev) => prev.map((i) => (i.id === id ? { ...i, qty: Math.min(qty, i.stock) } : i)));
   };
 
   const removeItem = (id) => setCart((prev) => prev.filter((i) => i.id !== id));
 
-  // ----- Totals (tax removed) -----
   const subtotal = useMemo(() => cart.reduce((s, i) => s + getUnitPrice(i) * i.qty, 0), [cart]);
 
   const discountAmt = discount
@@ -182,13 +163,34 @@ export default function Checkout() {
     : 0;
 
   const total = Math.max(0, subtotal - (Number(discountAmt) || 0));
-  const change = payMethod === "cash" && cashGiven ? parseFloat(cashGiven) - total : 0;
 
-  // ----- Customers: match list + auto-select exact phone/email/code -----
+  const paid = {
+    cash: Number(payments.cash || 0),
+    card: Number(payments.card || 0),
+    cheque: Number(payments.cheque || 0),
+    other: Number(payments.other || 0),
+  };
+
+  const paidTotal = paid.cash + paid.card + paid.cheque + paid.other;
+  const balanceDue = Math.max(0, total - paidTotal);
+  const change = Math.max(0, paidTotal - total);
+
+  const paymentMethod =
+    [paid.cash > 0, paid.card > 0, paid.cheque > 0, paid.other > 0].filter(Boolean).length > 1
+      ? "mixed"
+      : paid.cash > 0
+      ? "cash"
+      : paid.card > 0
+      ? "card"
+      : paid.cheque > 0
+      ? "cheque"
+      : paid.other > 0
+      ? "other"
+      : payFocus;
+
   const customerMatches = useMemo(() => {
     const q = customerSearch.trim().toLowerCase();
     if (!q) return customers.slice(0, 20);
-
     return customers
       .filter((c) => {
         const name = (c.name || "").toLowerCase();
@@ -236,39 +238,40 @@ export default function Checkout() {
   const saveNewCustomer = async () => {
     if (!newCustomer.name.trim()) return showToast("Customer name required", "warning");
 
-    try {
-      const payload = {
-        name: newCustomer.name.trim(),
-        phone: (newCustomer.phone || "").trim(),
-        email: (newCustomer.email || "").trim(),
-        address: encodeAddress((newCustomer.address || "").trim(), (newCustomer.code || "").trim()),
-      };
+    const payload = {
+      name: newCustomer.name.trim(),
+      phone: (newCustomer.phone || "").trim(),
+      email: (newCustomer.email || "").trim(),
+      address: encodeAddress((newCustomer.address || "").trim(), (newCustomer.code || "").trim()),
+    };
 
-      const res = await api.customers.create(payload);
-      if (res?.ok === false) return showToast(res.message || "Failed", "error");
+    const res = await api.customers.create(payload);
+    if (res?.ok === false) return showToast(res.message || "Failed", "error");
 
-      await reloadCustomers();
+    await reloadCustomers();
 
-      setSelectedCustomer({
-        id: res?.id,
-        ...payload,
-        address: stripCode(payload.address),
-        code: extractCode(payload.address),
-      });
+    setSelectedCustomer({
+      id: res?.id,
+      ...payload,
+      address: stripCode(payload.address),
+      code: extractCode(payload.address),
+    });
 
-      setNewCustomer({ name: "", phone: "", email: "", address: "", code: "" });
-      setNewCustomerMode(false);
-      setCustomerPanelOpen(false);
-      showToast("Customer saved");
-    } catch {
-      showToast("Failed to save customer", "error");
-    }
+    setNewCustomer({ name: "", phone: "", email: "", address: "", code: "" });
+    setNewCustomerMode(false);
+    setCustomerPanelOpen(false);
+    showToast("Customer saved");
   };
 
-  // ----- Receipt HTML (A4) -----
+  const formatContactHtml = (contact) => {
+    return escapeHtml(contact || "").replace(/\n/g, "<br/>");
+  };
+
   const buildReceiptHtmlA4 = (sale, { autoPrint = false } = {}) => {
     const dt = sale?.date ? new Date(sale.date) : new Date();
     const cust = sale.customer || null;
+    const sym = sale.symbol || symbol;
+    const contactHtml = formatContactHtml(sale.storeContact || "");
 
     const itemsHtml = (sale.items || [])
       .map(
@@ -276,8 +279,8 @@ export default function Checkout() {
       <tr>
         <td>${escapeHtml(it.product_name)}</td>
         <td style="text-align:center;">${escapeHtml(String(it.quantity))}</td>
-        <td style="text-align:right;">${money(it.price)}</td>
-        <td style="text-align:right;">${money(it.subtotal)}</td>
+        <td style="text-align:right;">${escapeHtml(sym)}${Number(it.price).toFixed(2)}</td>
+        <td style="text-align:right;">${escapeHtml(sym)}${Number(it.subtotal).toFixed(2)}</td>
       </tr>`
       )
       .join("");
@@ -292,12 +295,32 @@ export default function Checkout() {
           <b>Email:</b> ${escapeHtml(cust.email || "-")}<br/>
           <b>Address:</b> ${escapeHtml(cust.address || "-")}<br/>
         </div>
-      </div>
-    `
+      </div>`
       : `
       <div class="box">
         <div style="font-size:12px;color:#333;"><b>Customer</b></div>
         <div class="muted">Walk-in</div>
+      </div>`;
+
+    const pay = sale.payment || {};
+
+    const paySummaryHtml = `
+      <div class="box" style="margin-top:10px;">
+        <div style="font-size:12px;color:#333;"><b>Payment Summary</b></div>
+        <div class="muted" style="margin-top:6px;">
+          <b>Paid:</b> ${escapeHtml(sym)}${Number(pay.paidTotal || 0).toFixed(2)}<br/>
+          <b>Balance Due:</b> ${escapeHtml(sym)}${Number(pay.balanceDue || 0).toFixed(2)}<br/>
+          ${
+            Number(pay.change || 0) > 0
+              ? `<b>Change:</b> ${escapeHtml(sym)}${Number(pay.change || 0).toFixed(2)}<br/>`
+              : ``
+          }
+          <b>Breakdown:</b>
+          Cash ${escapeHtml(sym)}${Number(pay.cash || 0).toFixed(2)} ·
+          Card ${escapeHtml(sym)}${Number(pay.card || 0).toFixed(2)} ·
+          Cheque ${escapeHtml(sym)}${Number(pay.cheque || 0).toFixed(2)} ·
+          Other ${escapeHtml(sym)}${Number(pay.other || 0).toFixed(2)}
+        </div>
       </div>
     `;
 
@@ -310,14 +333,14 @@ export default function Checkout() {
     @page { size: A4; margin: 12mm; }
     html, body { background:#fff; color:#111; font-family: Arial, sans-serif; }
     .brand { font-size: 22px; font-weight: 800; }
-    .muted { color:#555; font-size: 12px; margin-top: 4px; line-height: 1.4; }
+    .muted { color:#555; font-size: 12px; margin-top: 4px; line-height: 1.45; }
     .hr { height:1px; background:#eee; margin: 10px 0; }
     table { width:100%; border-collapse: collapse; margin-top: 10px; }
     th, td { padding: 8px 6px; border-bottom: 1px solid #eee; font-size: 12px; }
     th { text-align:left; font-size: 12px; color:#333; background:#fafafa; }
     .right { text-align:right; }
     .totals { margin-top: 10px; display:flex; justify-content:flex-end; }
-    .totals table { width: 320px; }
+    .totals table { width: 340px; }
     .totals td { border-bottom:none; padding: 6px; }
     .grand { font-size: 14px; font-weight: 800; }
     .footer { margin-top: 14px; font-size: 12px; color: #555; text-align:center; }
@@ -329,13 +352,20 @@ export default function Checkout() {
     <div style="display:flex; justify-content:space-between; gap:12px;">
       <div>
         <div class="brand">${escapeHtml(sale.storeName || "RetailPOS")}</div>
-        <div class="muted">
+        ${
+          contactHtml
+            ? `<div class="muted" style="margin-top:6px;">${contactHtml}</div>`
+            : ``
+        }
+        <div class="muted" style="margin-top:8px;">
           <b>Receipt #:</b> ${escapeHtml(String(sale.id))}<br/>
           <b>Date:</b> ${escapeHtml(dt.toLocaleString())}<br/>
           <b>Payment:</b> ${escapeHtml(sale.payment_method || "-")}<br/>
           ${sale.cashier ? `<b>Cashier:</b> ${escapeHtml(sale.cashier)}<br/>` : ``}
+          <b>Status:</b> ${escapeHtml(sale.status || "completed")}<br/>
           <b>Returns:</b> customer must bring this receipt #
         </div>
+        ${paySummaryHtml}
       </div>
       ${customerHtml}
     </div>
@@ -356,15 +386,13 @@ export default function Checkout() {
 
     <div class="totals">
       <table>
-        <tr><td class="right">Subtotal</td><td class="right">${money(sale.subtotal)}</td></tr>
+        <tr><td class="right">Subtotal</td><td class="right">${escapeHtml(sym)}${Number(sale.subtotal).toFixed(2)}</td></tr>
         ${
           Number(sale.discount || 0) > 0
-            ? `<tr><td class="right">Discount</td><td class="right">-${money(
-                sale.discount
-              )}</td></tr>`
+            ? `<tr><td class="right">Discount</td><td class="right">-${escapeHtml(sym)}${Number(sale.discount).toFixed(2)}</td></tr>`
             : ``
         }
-        <tr><td class="right grand">Total</td><td class="right grand">${money(sale.total)}</td></tr>
+        <tr><td class="right grand">Total</td><td class="right grand">${escapeHtml(sym)}${Number(sale.total).toFixed(2)}</td></tr>
       </table>
     </div>
 
@@ -387,10 +415,7 @@ export default function Checkout() {
 
   const saveReceiptPdf = async () => {
     if (!lastSale) return;
-    if (!api.receipt?.savePdf) {
-      showToast("Save PDF not enabled (missing main.js/preload.js setup)", "error");
-      return;
-    }
+    if (!api.receipt?.savePdf) return showToast("Save PDF not enabled", "error");
     const html = buildReceiptHtmlA4(lastSale, { autoPrint: false });
     const res = await api.receipt.savePdf({ html, fileName: `Receipt-${lastSale.id}.pdf` });
     if (!res?.ok) return showToast(res?.message || "Save failed", "error");
@@ -417,30 +442,34 @@ export default function Checkout() {
       return;
     }
 
-    // fallback
-    const body = `Thank you for your purchase.\nReceipt #: ${lastSale.id}\nTotal: ${money(
-      lastSale.total
-    )}\n\n(Bring this receipt number for returns.)`;
-    window.open(
-      `mailto:${encodeURIComponent(email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(
-        body
-      )}`
-    );
-    showToast("Opened email draft (attachment requires email setup)", "warning");
+    window.open(`mailto:${encodeURIComponent(email)}?subject=${encodeURIComponent(subject)}`);
+    showToast("Opened email draft", "warning");
   };
 
-  // ----- Sale / Charge -----
   const handleCharge = async () => {
     if (!cart.length) return showToast("Cart is empty", "warning");
     if (!me) return showToast("Login required before selling", "warning");
+
+    const paymentObj = {
+      method: paymentMethod,
+      cash: paid.cash,
+      card: paid.card,
+      cheque: paid.cheque,
+      other: paid.other,
+      paidTotal,
+      balanceDue,
+      change,
+    };
 
     const sale = {
       total,
       subtotal,
       tax: 0,
       discount: discountAmt,
-      payment_method: payMethod,
-      note: "",
+      payment_method: paymentMethod,
+      payment_json: JSON.stringify(paymentObj),
+      status: balanceDue > 0 ? "due" : "completed",
+      note: balanceDue > 0 ? `Balance due: ${fmt(balanceDue)}` : "",
       customer_id: selectedCustomer?.id || null,
       customer_name: selectedCustomer?.name || null,
     };
@@ -456,49 +485,50 @@ export default function Checkout() {
       };
     });
 
-    try {
-      const res = await api.sales.create({ sale, items });
+    const res = await api.sales.create({ sale, items });
+    if (res?.ok === false) return showToast(res.message || "Failed", "error");
+    const saleId = typeof res === "object" ? res.saleId : res;
 
-      if (res && typeof res === "object" && res.ok === false) {
-        showToast(res.message || "Failed", "error");
-        return;
-      }
+    setLastSale({
+      id: saleId,
+      ...sale,
+      items,
+      date: new Date(),
+      cashier: me?.name || null,
+      storeName,
+      storeContact,
+      footer: receiptFooter,
+      customer: selectedCustomer ? { ...selectedCustomer } : null,
+      symbol,
+      payment: paymentObj,
+    });
 
-      const saleId = res && typeof res === "object" ? res.saleId : res;
+    setShowReceipt(true);
+    setCart([]);
+    setDiscount("");
+    setPayments({ cash: "", card: "", cheque: "", other: "" });
 
-      const receipt = {
-        id: saleId,
-        ...sale,
-        items,
-        date: new Date(),
-        cashier: me?.name || null,
-        storeName,
-        footer: receiptFooter,
-        customer: selectedCustomer ? { ...selectedCustomer } : null,
-      };
-
-      setLastSale(receipt);
-      setShowReceipt(true);
-
-      setCart([]);
-      setDiscount("");
-      setCashGiven("");
-      await reloadProducts();
-
-      showToast("Sale completed!");
-    } catch {
-      showToast("Failed to process sale", "error");
-    }
+    await reloadProducts();
+    showToast(balanceDue > 0 ? "Saved as Balance Due" : "Sale completed!");
   };
 
-  // ----- UI -----
   return (
     <div style={{ display: "flex", height: "100%", overflow: "hidden" }}>
-      {/* Products Panel */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", padding: 20, gap: 12 }}>
         <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
           <div style={{ flex: 1, position: "relative" }}>
-            <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", color: "var(--text3)", fontSize: 16 }}>🔍</span>
+            <span
+              style={{
+                position: "absolute",
+                left: 12,
+                top: "50%",
+                transform: "translateY(-50%)",
+                color: "var(--text3)",
+                fontSize: 16,
+              }}
+            >
+              🔍
+            </span>
             <input
               ref={searchRef}
               value={search}
@@ -516,16 +546,18 @@ export default function Checkout() {
             />
           </div>
 
-          <div style={{
-            padding: "8px 10px",
-            borderRadius: 999,
-            border: "1px solid var(--border)",
-            background: "rgba(255,255,255,0.04)",
-            color: "var(--text2)",
-            fontSize: 12,
-            fontWeight: 700,
-            whiteSpace: "nowrap",
-          }}>
+          <div
+            style={{
+              padding: "8px 10px",
+              borderRadius: 999,
+              border: "1px solid var(--border)",
+              background: "rgba(255,255,255,0.04)",
+              color: "var(--text2)",
+              fontSize: 12,
+              fontWeight: 900,
+              whiteSpace: "nowrap",
+            }}
+          >
             {me ? `👤 ${me.name}` : "🔒 Login required"}
           </div>
         </div>
@@ -539,9 +571,9 @@ export default function Checkout() {
                 padding: "6px 14px",
                 borderRadius: 20,
                 fontSize: 13,
-                fontWeight: 500,
+                fontWeight: 900,
                 flexShrink: 0,
-                background: catFilter === cat ? (catColors[cat] || "var(--accent)") : "var(--surface)",
+                background: catFilter === cat ? catColors[cat] || "var(--accent)" : "var(--surface)",
                 color: catFilter === cat ? "white" : "var(--text2)",
                 border: `1px solid ${catFilter === cat ? "transparent" : "var(--border)"}`,
               }}
@@ -551,7 +583,16 @@ export default function Checkout() {
           ))}
         </div>
 
-        <div style={{ flex: 1, overflowY: "auto", display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 10, alignContent: "start" }}>
+        <div
+          style={{
+            flex: 1,
+            overflowY: "auto",
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))",
+            gap: 10,
+            alignContent: "start",
+          }}
+        >
           {filtered.map((p) => (
             <button
               key={p.id}
@@ -564,71 +605,104 @@ export default function Checkout() {
                 textAlign: "left",
                 cursor: "pointer",
                 transition: "all 0.15s",
-                position: "relative",
-                overflow: "hidden",
               }}
-              onMouseEnter={(e) => { e.currentTarget.style.borderColor = catColors[p.category] || "var(--accent)"; e.currentTarget.style.transform = "translateY(-2px)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.borderColor = "var(--border)"; e.currentTarget.style.transform = "none"; }}
             >
-              <div style={{ width: "100%", height: 40, borderRadius: 8, marginBottom: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, background: `${catColors[p.category] || "#6366f1"}22` }}>
+              <div
+                style={{
+                  width: "100%",
+                  height: 40,
+                  borderRadius: 8,
+                  marginBottom: 10,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  fontSize: 22,
+                  background: `${catColors[p.category] || "#6366f1"}22`,
+                }}
+              >
                 {categoryIcon(p.category)}
               </div>
-              <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", marginBottom: 4, lineHeight: 1.3 }}>{p.name}</div>
+              <div style={{ fontSize: 12, fontWeight: 900, color: "var(--text)", marginBottom: 4 }}>
+                {p.name}
+              </div>
               <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 8 }}>{p.sku}</div>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span style={{ fontWeight: 700, color: "var(--accent)", fontSize: 14 }} className="mono">{fmt(p.price)}</span>
-                <span style={{
-                  fontSize: 10, padding: "2px 6px", borderRadius: 4, fontWeight: 600,
-                  background: p.stock <= p.low_stock_threshold ? "rgba(244,63,94,0.15)" : "rgba(74,222,128,0.1)",
-                  color: p.stock <= p.low_stock_threshold ? "var(--danger)" : "var(--accent2)",
-                }}>{p.stock}</span>
+                <span style={{ fontWeight: 900, color: "var(--accent)", fontSize: 14 }} className="mono">
+                  {fmt(p.price)}
+                </span>
+                <span
+                  style={{
+                    fontSize: 10,
+                    padding: "2px 6px",
+                    borderRadius: 4,
+                    fontWeight: 900,
+                    background:
+                      p.stock <= p.low_stock_threshold
+                        ? "rgba(244,63,94,0.15)"
+                        : "rgba(74,222,128,0.1)",
+                    color:
+                      p.stock <= p.low_stock_threshold ? "var(--danger)" : "var(--accent2)",
+                  }}
+                >
+                  {p.stock}
+                </span>
               </div>
             </button>
           ))}
-          {filtered.length === 0 && (
-            <div style={{ gridColumn: "1/-1", textAlign: "center", color: "var(--text3)", padding: 40 }}>
-              No products found
-            </div>
-          )}
         </div>
       </div>
 
-      {/* Cart Panel */}
-      <div style={{ width: 400, background: "var(--surface)", borderLeft: "1px solid var(--border)", display: "flex", flexDirection: "column" }}>
-        <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span style={{ fontWeight: 700, fontSize: 15 }}>
+      <div
+        style={{
+          width: 440,
+          background: "var(--surface)",
+          borderLeft: "1px solid var(--border)",
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
+        <div
+          style={{
+            padding: "16px 20px",
+            borderBottom: "1px solid var(--border)",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+          }}
+        >
+          <span style={{ fontWeight: 900, fontSize: 15 }}>
             🛒 Cart {cart.length > 0 && <span style={{ color: "var(--accent)" }}>({cart.length})</span>}
           </span>
           {cart.length > 0 && (
-            <button onClick={() => setCart([])} style={{ color: "var(--danger)", background: "none", fontSize: 12 }}>
+            <button
+              onClick={() => setCart([])}
+              style={{ color: "var(--danger)", background: "none", fontSize: 12, fontWeight: 900 }}
+            >
               Clear all
             </button>
           )}
         </div>
 
-        {/* Customer bar */}
         <div style={{ padding: "12px 20px", borderBottom: "1px solid var(--border)" }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
             <div>
-              <div style={{ fontSize: 12, color: "var(--text2)", fontWeight: 800 }}>Customer</div>
-              <div style={{ fontSize: 13, color: "var(--text)" }}>
-                {selectedCustomer ? (
-                  <>
-                    <b>{selectedCustomer.name}</b>
-                    <div style={{ fontSize: 11, color: "var(--text3)" }}>
-                      {selectedCustomer.phone || ""}
-                      {selectedCustomer.phone && selectedCustomer.email ? " · " : ""}
-                      {selectedCustomer.email || ""}
-                      {selectedCustomer.code ? ` · CODE:${selectedCustomer.code}` : ""}
-                    </div>
-                    {selectedCustomer.address ? (
-                      <div style={{ fontSize: 11, color: "var(--text3)" }}>{selectedCustomer.address}</div>
-                    ) : null}
-                  </>
-                ) : (
-                  <span style={{ color: "var(--text3)" }}>Walk-in</span>
-                )}
-              </div>
+              <div style={{ fontSize: 12, color: "var(--text2)", fontWeight: 900 }}>Customer</div>
+              {selectedCustomer ? (
+                <div style={{ fontSize: 13 }}>
+                  <b>{selectedCustomer.name}</b>
+                  <div style={{ fontSize: 11, color: "var(--text3)" }}>
+                    {selectedCustomer.phone || ""}
+                    {selectedCustomer.phone && selectedCustomer.email ? " · " : ""}
+                    {selectedCustomer.email || ""}
+                    {selectedCustomer.code ? ` · CODE:${selectedCustomer.code}` : ""}
+                  </div>
+                  {selectedCustomer.address ? (
+                    <div style={{ fontSize: 11, color: "var(--text3)" }}>{selectedCustomer.address}</div>
+                  ) : null}
+                </div>
+              ) : (
+                <div style={{ color: "var(--text3)", fontSize: 13 }}>Walk-in</div>
+              )}
             </div>
 
             <div style={{ display: "flex", gap: 8 }}>
@@ -637,10 +711,12 @@ export default function Checkout() {
                   Clear
                 </button>
               )}
-
               <button
-                onClick={() => { setCustomerPanelOpen(!customerPanelOpen); setNewCustomerMode(false); }}
-                style={btnSoft()}
+                onClick={() => {
+                  setCustomerPanelOpen(!customerPanelOpen);
+                  setNewCustomerMode(false);
+                }}
+                style={btnSoft(false)}
               >
                 {customerPanelOpen ? "Close" : "Select / Add"}
               </button>
@@ -648,19 +724,34 @@ export default function Checkout() {
           </div>
 
           {customerPanelOpen && (
-            <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+            <div
+              style={{
+                marginTop: 10,
+                paddingTop: 10,
+                borderTop: "1px solid rgba(255,255,255,0.06)",
+              }}
+            >
               {!newCustomerMode ? (
                 <>
                   <input
                     value={customerSearch}
                     onChange={(e) => setCustomerSearch(e.target.value)}
-                    placeholder="Search or scan: phone / email / customer code…"
+                    placeholder="Search or scan phone/email/code…"
                     style={miniInputStyle()}
                   />
-
-                  <div style={{ maxHeight: 160, overflow: "auto", border: "1px solid var(--border)", borderRadius: 12, marginTop: 8 }}>
+                  <div
+                    style={{
+                      maxHeight: 160,
+                      overflow: "auto",
+                      border: "1px solid var(--border)",
+                      borderRadius: 12,
+                      marginTop: 8,
+                    }}
+                  >
                     {customerMatches.length === 0 ? (
-                      <div style={{ padding: 10, color: "var(--text3)", fontSize: 12 }}>No customers found.</div>
+                      <div style={{ padding: 10, color: "var(--text3)", fontSize: 12 }}>
+                        No customers found.
+                      </div>
                     ) : (
                       customerMatches.map((c) => (
                         <button
@@ -691,7 +782,10 @@ export default function Checkout() {
 
                   <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
                     <button
-                      onClick={() => { setNewCustomerMode(true); setNewCustomer({ name: "", phone: "", email: "", address: "", code: "" }); }}
+                      onClick={() => {
+                        setNewCustomerMode(true);
+                        setNewCustomer({ name: "", phone: "", email: "", address: "", code: "" });
+                      }}
                       style={btnGhostWide()}
                     >
                       + Add new customer
@@ -704,15 +798,40 @@ export default function Checkout() {
               ) : (
                 <>
                   <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
-                    <input value={newCustomer.name} onChange={(e) => setNewCustomer({ ...newCustomer, name: e.target.value })} placeholder="Name *" style={miniInputStyle()} />
-                    <input value={newCustomer.phone} onChange={(e) => setNewCustomer({ ...newCustomer, phone: e.target.value })} placeholder="Phone" style={miniInputStyle()} />
-                    <input value={newCustomer.email} onChange={(e) => setNewCustomer({ ...newCustomer, email: e.target.value })} placeholder="Email" style={{ ...miniInputStyle(), gridColumn: "1/-1" }} />
-                    <input value={newCustomer.address} onChange={(e) => setNewCustomer({ ...newCustomer, address: e.target.value })} placeholder="Address" style={{ ...miniInputStyle(), gridColumn: "1/-1" }} />
-                    <input value={newCustomer.code} onChange={(e) => setNewCustomer({ ...newCustomer, code: e.target.value })} placeholder="Customer code / barcode (optional)" style={{ ...miniInputStyle(), gridColumn: "1/-1" }} />
+                    <input
+                      value={newCustomer.name}
+                      onChange={(e) => setNewCustomer({ ...newCustomer, name: e.target.value })}
+                      placeholder="Name *"
+                      style={miniInputStyle()}
+                    />
+                    <input
+                      value={newCustomer.phone}
+                      onChange={(e) => setNewCustomer({ ...newCustomer, phone: e.target.value })}
+                      placeholder="Phone"
+                      style={miniInputStyle()}
+                    />
+                    <input
+                      value={newCustomer.email}
+                      onChange={(e) => setNewCustomer({ ...newCustomer, email: e.target.value })}
+                      placeholder="Email"
+                      style={{ ...miniInputStyle(), gridColumn: "1/-1" }}
+                    />
+                    <input
+                      value={newCustomer.address}
+                      onChange={(e) => setNewCustomer({ ...newCustomer, address: e.target.value })}
+                      placeholder="Address"
+                      style={{ ...miniInputStyle(), gridColumn: "1/-1" }}
+                    />
+                    <input
+                      value={newCustomer.code}
+                      onChange={(e) => setNewCustomer({ ...newCustomer, code: e.target.value })}
+                      placeholder="Customer code (optional)"
+                      style={{ ...miniInputStyle(), gridColumn: "1/-1" }}
+                    />
                   </div>
 
                   <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                    <button onClick={saveNewCustomer} style={btnSoftWide()}>
+                    <button onClick={saveNewCustomer} style={btnSoftWide(false)}>
                       Save customer
                     </button>
                     <button onClick={() => setNewCustomerMode(false)} style={btnGhost()}>
@@ -725,7 +844,6 @@ export default function Checkout() {
           )}
         </div>
 
-        {/* Cart Items */}
         <div style={{ flex: 1, overflowY: "auto", padding: "8px 0" }}>
           {cart.length === 0 ? (
             <div style={{ textAlign: "center", color: "var(--text3)", padding: "60px 20px" }}>
@@ -739,26 +857,35 @@ export default function Checkout() {
               const overridden = item.priceOverride !== null && item.priceOverride !== undefined;
 
               return (
-                <div key={item.id} style={{ padding: "10px 20px", display: "flex", gap: 10, alignItems: "center", borderBottom: "1px solid var(--border)" }}>
+                <div
+                  key={item.id}
+                  style={{
+                    padding: "10px 20px",
+                    display: "flex",
+                    gap: 10,
+                    alignItems: "center",
+                    borderBottom: "1px solid var(--border)",
+                  }}
+                >
                   <div style={{ flex: 1 }}>
                     <div style={{ fontWeight: 900, fontSize: 13, marginBottom: 2 }}>{item.name}</div>
-
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <div style={{ color: "var(--accent)", fontSize: 13 }} className="mono">
                         {fmt(unit)}
                       </div>
-
                       <button onClick={() => openPriceEdit(item)} style={miniBtn()} title="Price correction">
                         Edit price
                       </button>
-
                       {overridden && (
-                        <button onClick={() => resetPrice(item)} style={miniBtnDanger()} title={`Reset to original ${fmt(item.price)}`}>
+                        <button
+                          onClick={() => resetPrice(item)}
+                          style={miniBtnDanger()}
+                          title={`Reset to ${fmt(item.price)}`}
+                        >
                           Reset
                         </button>
                       )}
                     </div>
-
                     {overridden && (
                       <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>
                         Original: {fmt(item.price)}
@@ -767,14 +894,25 @@ export default function Checkout() {
                   </div>
 
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <button onClick={() => updateQty(item.id, item.qty - 1)} style={qtyBtnStyle()}>−</button>
-                    <span style={{ width: 24, textAlign: "center", fontWeight: 900, fontSize: 14 }}>{item.qty}</span>
-                    <button onClick={() => updateQty(item.id, item.qty + 1)} style={qtyBtnStyle()}>+</button>
+                    <button onClick={() => updateQty(item.id, item.qty - 1)} style={qtyBtnStyle()}>
+                      −
+                    </button>
+                    <span style={{ width: 24, textAlign: "center", fontWeight: 900, fontSize: 14 }}>
+                      {item.qty}
+                    </span>
+                    <button onClick={() => updateQty(item.id, item.qty + 1)} style={qtyBtnStyle()}>
+                      +
+                    </button>
                   </div>
 
-                  <div style={{ width: 92, textAlign: "right" }}>
-                    <div className="mono" style={{ fontWeight: 900, fontSize: 13 }}>{fmt(lineTotal)}</div>
-                    <button onClick={() => removeItem(item.id)} style={{ color: "var(--danger)", background: "none", fontSize: 11 }}>
+                  <div style={{ width: 110, textAlign: "right" }}>
+                    <div className="mono" style={{ fontWeight: 900, fontSize: 13 }}>
+                      {fmt(lineTotal)}
+                    </div>
+                    <button
+                      onClick={() => removeItem(item.id)}
+                      style={{ color: "var(--danger)", background: "none", fontSize: 11, fontWeight: 900 }}
+                    >
                       Remove
                     </button>
                   </div>
@@ -784,54 +922,105 @@ export default function Checkout() {
           )}
         </div>
 
-        {/* Totals & Payment */}
-        <div style={{ padding: 20, borderTop: "1px solid var(--border)", display: "flex", flexDirection: "column", gap: 12 }}>
+        <div
+          style={{
+            padding: 20,
+            borderTop: "1px solid var(--border)",
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
+          }}
+        >
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <span style={{ color: "var(--text2)", fontSize: 13, flex: 1 }}>Discount</span>
-            <input value={discount} onChange={(e) => setDiscount(e.target.value)} placeholder="e.g. 10 or 10%" style={smallInputStyle()} />
+            <span style={{ color: "var(--text2)", fontSize: 13, flex: 1, fontWeight: 900 }}>
+              Discount
+            </span>
+            <input
+              value={discount}
+              onChange={(e) => setDiscount(e.target.value)}
+              placeholder="e.g. 10 or 10%"
+              style={smallInputStyle()}
+            />
           </div>
 
-          <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: "12px 0", borderTop: "1px solid var(--border)" }}>
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+              padding: "12px 0",
+              borderTop: "1px solid var(--border)",
+            }}
+          >
             <Row label="Subtotal" value={fmt(subtotal)} />
             {discountAmt > 0 && <Row label="Discount" value={`-${fmt(discountAmt)}`} color="var(--accent2)" />}
+            <Row label="Paid" value={fmt(paidTotal)} />
+            <Row label="Balance Due" value={fmt(balanceDue)} color={balanceDue > 0 ? "var(--danger)" : undefined} />
+            {change > 0 && <Row label="Change" value={fmt(change)} color="var(--accent2)" />}
             <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
               <span style={{ fontWeight: 900, fontSize: 16 }}>Total</span>
-              <span className="mono" style={{ fontWeight: 900, fontSize: 20, color: "var(--accent)" }}>{fmt(total)}</span>
+              <span className="mono" style={{ fontWeight: 900, fontSize: 20, color: "var(--accent)" }}>
+                {fmt(total)}
+              </span>
             </div>
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
-            {["cash", "card", "other"].map((m) => (
-              <button key={m} onClick={() => setPayMethod(m)} style={{
-                padding: "8px 4px",
-                borderRadius: 8,
-                fontSize: 12,
-                fontWeight: 900,
-                textTransform: "uppercase",
-                letterSpacing: "0.05em",
-                background: payMethod === m ? "rgba(108,99,255,0.2)" : "var(--surface2)",
-                color: payMethod === m ? "var(--accent)" : "var(--text2)",
-                border: `1px solid ${payMethod === m ? "var(--accent)" : "var(--border)"}`,
-                cursor: "pointer",
-              }}>
-                {m === "cash" ? "💵" : m === "card" ? "💳" : "📱"} {m}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6 }}>
+            {[
+              { id: "cash", label: "Cash", icon: "💵" },
+              { id: "card", label: "Card", icon: "💳" },
+              { id: "cheque", label: "Cheque", icon: "🧾" },
+              { id: "other", label: "Other", icon: "📱" },
+            ].map((m) => (
+              <button
+                key={m.id}
+                onClick={() => setPayFocus(m.id)}
+                style={{
+                  padding: "8px 6px",
+                  borderRadius: 8,
+                  fontSize: 12,
+                  fontWeight: 900,
+                  background: payFocus === m.id ? "rgba(108,99,255,0.2)" : "var(--surface2)",
+                  color: payFocus === m.id ? "var(--accent)" : "var(--text2)",
+                  border: `1px solid ${payFocus === m.id ? "var(--accent)" : "var(--border)"}`,
+                  cursor: "pointer",
+                }}
+              >
+                {m.icon} {m.label}
               </button>
             ))}
           </div>
 
-          {payMethod === "cash" && (
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <span style={{ color: "var(--text2)", fontSize: 13, flex: 1 }}>Cash Given</span>
-              <input value={cashGiven} onChange={(e) => setCashGiven(e.target.value)} placeholder="0.00" type="number" style={smallInputStyle()} />
-            </div>
-          )}
-
-          {payMethod === "cash" && cashGiven && change >= 0 && (
-            <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 12px", background: "rgba(74,222,128,0.1)", borderRadius: 8, border: "1px solid rgba(74,222,128,0.2)" }}>
-              <span style={{ color: "var(--accent2)", fontWeight: 900, fontSize: 13 }}>Change</span>
-              <span className="mono" style={{ color: "var(--accent2)", fontWeight: 900, fontSize: 15 }}>{fmt(change)}</span>
-            </div>
-          )}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <PayInput
+              label="Cash"
+              value={payments.cash}
+              active={payFocus === "cash"}
+              onChange={(v) => setPayments((p) => ({ ...p, cash: v }))}
+              symbol={symbol}
+            />
+            <PayInput
+              label="Card"
+              value={payments.card}
+              active={payFocus === "card"}
+              onChange={(v) => setPayments((p) => ({ ...p, card: v }))}
+              symbol={symbol}
+            />
+            <PayInput
+              label="Cheque"
+              value={payments.cheque}
+              active={payFocus === "cheque"}
+              onChange={(v) => setPayments((p) => ({ ...p, cheque: v }))}
+              symbol={symbol}
+            />
+            <PayInput
+              label="Other"
+              value={payments.other}
+              active={payFocus === "other"}
+              onChange={(v) => setPayments((p) => ({ ...p, other: v }))}
+              symbol={symbol}
+            />
+          </div>
 
           <button
             onClick={handleCharge}
@@ -844,42 +1033,67 @@ export default function Checkout() {
               background: cart.length && me ? "var(--accent)" : "var(--surface3)",
               color: cart.length && me ? "white" : "var(--text3)",
               boxShadow: cart.length && me ? "0 4px 20px rgba(108,99,255,0.4)" : "none",
-              transition: "all 0.2s",
               cursor: cart.length && me ? "pointer" : "not-allowed",
             }}
           >
-            {!me ? "Login to charge" : cart.length ? `Charge ${fmt(total)}` : "Add items to cart"}
+            {balanceDue > 0 ? `Save (Due ${fmt(balanceDue)})` : `Charge ${fmt(total)}`}
           </button>
         </div>
       </div>
 
-      {/* Receipt Modal */}
       {showReceipt && lastSale && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center" }}>
-          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: 28, width: 560, boxShadow: "var(--shadow)" }}>
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.7)",
+            zIndex: 200,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <div
+            style={{
+              background: "var(--surface)",
+              border: "1px solid var(--border)",
+              borderRadius: 16,
+              padding: 28,
+              width: 560,
+              boxShadow: "var(--shadow)",
+            }}
+          >
             <div style={{ textAlign: "center", marginBottom: 16 }}>
               <div style={{ fontSize: 40 }}>✅</div>
-              <div style={{ fontWeight: 900, fontSize: 18, marginTop: 8 }}>Sale Complete!</div>
-              <div style={{ color: "var(--text3)", fontSize: 13 }}>{new Date(lastSale.date).toLocaleString()}</div>
-
-              <div style={{ color: "var(--text2)", fontSize: 12, marginTop: 6 }}>
-                Receipt #: <b>{lastSale.id}</b> (customer must bring this for returns)
+              <div style={{ fontWeight: 900, fontSize: 18, marginTop: 8 }}>
+                {lastSale.status === "due" ? "Saved as Due" : "Sale Complete!"}
               </div>
-
-              {lastSale.customer?.name && (
-                <div style={{ color: "var(--text2)", fontSize: 12, marginTop: 6, lineHeight: 1.4 }}>
-                  Customer: <b>{lastSale.customer.name}</b>
-                  {lastSale.customer.phone ? ` · ${lastSale.customer.phone}` : ""}
-                  {lastSale.customer.email ? ` · ${lastSale.customer.email}` : ""}
-                  {lastSale.customer.address ? <div style={{ color: "var(--text3)" }}>{lastSale.customer.address}</div> : null}
-                </div>
-              )}
+              <div style={{ color: "var(--text3)", fontSize: 13 }}>
+                {new Date(lastSale.date).toLocaleString()}
+              </div>
+              <div style={{ color: "var(--text2)", fontSize: 12, marginTop: 6 }}>
+                Receipt #: <b>{lastSale.id}</b>
+              </div>
+              <div style={{ color: "var(--text2)", fontSize: 12, marginTop: 6 }}>
+                Paid: <b>{fmt(lastSale.payment?.paidTotal || 0)}</b> · Due:{" "}
+                <b>{fmt(lastSale.payment?.balanceDue || 0)}</b>
+              </div>
             </div>
 
-            <div style={{ borderTop: "1px dashed var(--border)", padding: "14px 0", display: "flex", flexDirection: "column", gap: 6 }}>
+            <div
+              style={{
+                borderTop: "1px dashed var(--border)",
+                padding: "14px 0",
+                display: "flex",
+                flexDirection: "column",
+                gap: 6,
+              }}
+            >
               {lastSale.items.map((it, i) => (
                 <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
-                  <span>{it.product_name} × {it.quantity}</span>
+                  <span>
+                    {it.product_name} × {it.quantity}
+                  </span>
                   <span className="mono">{fmt(it.subtotal)}</span>
                 </div>
               ))}
@@ -888,50 +1102,57 @@ export default function Checkout() {
             <div style={{ borderTop: "1px dashed var(--border)", paddingTop: 12 }}>
               <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 900, fontSize: 16 }}>
                 <span>Total</span>
-                <span className="mono" style={{ color: "var(--accent)" }}>{fmt(lastSale.total)}</span>
+                <span className="mono" style={{ color: "var(--accent)" }}>
+                  {fmt(lastSale.total)}
+                </span>
               </div>
             </div>
 
             <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
-              <button onClick={printReceiptA4} style={actionBtn("soft")}>Print (A4)</button>
-              <button onClick={saveReceiptPdf} style={actionBtn("neutral")}>Save PDF</button>
+              <button onClick={printReceiptA4} style={actionBtn("soft")}>
+                Print (A4)
+              </button>
+              <button onClick={saveReceiptPdf} style={actionBtn("neutral")}>
+                Save PDF
+              </button>
               <button
                 onClick={emailReceipt}
                 disabled={!lastSale?.customer?.email}
-                title={!lastSale?.customer?.email ? "Customer email not set" : "Send receipt to customer email"}
                 style={actionBtn("neutral", !lastSale?.customer?.email)}
               >
                 Email receipt
               </button>
-              <button onClick={() => setShowReceipt(false)} style={actionBtn("primary")}>New Sale</button>
+              <button onClick={() => setShowReceipt(false)} style={actionBtn("primary")}>
+                New Sale
+              </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* ✅ Price correction popup (must be OUTSIDE receipt modal) */}
       {priceEditItem && (
-        <div style={{
-          position: "fixed",
-          inset: 0,
-          background: "rgba(0,0,0,0.6)",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          zIndex: 9999
-        }}>
-          <div style={{
-            width: 360,
-            background: "var(--surface)",
-            border: "1px solid var(--border)",
-            borderRadius: 16,
-            padding: 16,
-            boxShadow: "var(--shadow)"
-          }}>
-            <div style={{ fontWeight: 900, fontSize: 16, marginBottom: 10 }}>
-              Price correction
-            </div>
-
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.6)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 9999,
+          }}
+        >
+          <div
+            style={{
+              width: 360,
+              background: "var(--surface)",
+              border: "1px solid var(--border)",
+              borderRadius: 16,
+              padding: 16,
+              boxShadow: "var(--shadow)",
+            }}
+          >
+            <div style={{ fontWeight: 900, fontSize: 16, marginBottom: 10 }}>Price correction</div>
             <div style={{ color: "var(--text2)", fontSize: 12, marginBottom: 10 }}>
               {priceEditItem.name} (original {fmt(priceEditItem.price)})
             </div>
@@ -956,7 +1177,7 @@ export default function Checkout() {
               <button onClick={() => setPriceEditItem(null)} style={btnGhostWide()}>
                 Cancel
               </button>
-              <button onClick={applyPriceEdit} style={btnSoftWide()}>
+              <button onClick={applyPriceEdit} style={btnSoftWide(false)}>
                 Save
               </button>
             </div>
@@ -967,13 +1188,52 @@ export default function Checkout() {
   );
 }
 
-/* ---------------- small UI helpers ---------------- */
+function PayInput({ label, value, onChange, active, symbol }) {
+  return (
+    <div>
+      <div style={{ fontSize: 12, color: "var(--text2)", fontWeight: 900, marginBottom: 6 }}>
+        {label}
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <div
+          style={{
+            padding: "10px 10px",
+            borderRadius: 12,
+            border: "1px solid var(--border)",
+            background: "rgba(0,0,0,0.25)",
+            color: "var(--text2)",
+            fontWeight: 900,
+          }}
+        >
+          {symbol}
+        </div>
+        <input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          type="number"
+          placeholder="0.00"
+          style={{
+            flex: 1,
+            padding: "10px 12px",
+            borderRadius: 12,
+            border: `1px solid ${active ? "rgba(108,99,255,0.8)" : "var(--border)"}`,
+            background: "rgba(0,0,0,0.25)",
+            color: "var(--text)",
+            outline: "none",
+          }}
+        />
+      </div>
+    </div>
+  );
+}
 
 function Row({ label, value, color }) {
   return (
     <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
-      <span style={{ color: "var(--text2)" }}>{label}</span>
-      <span className="mono" style={{ color: color || "var(--text)" }}>{value}</span>
+      <span style={{ color: "var(--text2)", fontWeight: 900 }}>{label}</span>
+      <span className="mono" style={{ color: color || "var(--text)", fontWeight: 900 }}>
+        {value}
+      </span>
     </div>
   );
 }
@@ -988,10 +1248,6 @@ function categoryIcon(cat) {
     Books: "📚",
   };
   return icons[cat] || "📦";
-}
-
-function money(n) {
-  return `$${(Number(n) || 0).toFixed(2)}`;
 }
 
 function escapeHtml(s) {
@@ -1014,6 +1270,7 @@ function smallInputStyle() {
     fontSize: 13,
     textAlign: "right",
     outline: "none",
+    fontWeight: 900,
   };
 }
 
@@ -1026,6 +1283,7 @@ function miniInputStyle() {
     background: "rgba(0,0,0,0.25)",
     color: "var(--text)",
     outline: "none",
+    fontWeight: 900,
   };
 }
 
@@ -1058,8 +1316,20 @@ function actionBtn(kind, disabled = false) {
   };
 
   if (kind === "primary") return { ...base, background: "var(--accent)", color: "white", border: "none" };
-  if (kind === "soft") return { ...base, background: "rgba(108,99,255,0.18)", border: "1px solid rgba(108,99,255,0.6)", color: "var(--accent)" };
-  return { ...base, background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)" };
+  if (kind === "soft") {
+    return {
+      ...base,
+      background: "rgba(108,99,255,0.18)",
+      border: "1px solid rgba(108,99,255,0.6)",
+      color: "var(--accent)",
+    };
+  }
+  return {
+    ...base,
+    background: "var(--surface2)",
+    border: "1px solid var(--border)",
+    color: "var(--text)",
+  };
 }
 
 function miniBtn() {
@@ -1104,7 +1374,7 @@ function btnGhostWide() {
   return { ...btnGhost(), flex: 1 };
 }
 
-function btnSoft() {
+function btnSoft(disabled) {
   return {
     padding: "8px 10px",
     borderRadius: 10,
@@ -1112,10 +1382,11 @@ function btnSoft() {
     background: "rgba(108,99,255,0.18)",
     color: "var(--accent)",
     fontWeight: 900,
-    cursor: "pointer",
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.6 : 1,
   };
 }
 
-function btnSoftWide() {
-  return { ...btnSoft(), flex: 1 };
+function btnSoftWide(disabled) {
+  return { ...btnSoft(disabled), flex: 1 };
 }
