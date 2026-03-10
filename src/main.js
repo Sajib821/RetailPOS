@@ -9,8 +9,8 @@ const { autoUpdater } = require("electron-updater");
 const path = require("path");
 const crypto = require("crypto");
 const fs = require("fs/promises");
-
-require("dotenv").config();
+const fsSync = require("fs");
+const dotenv = require("dotenv");
 
 const isDev = process.env.NODE_ENV === "development" || !app.isPackaged;
 
@@ -168,6 +168,59 @@ function safeHandle(channel, handler) {
     ipcMain.removeHandler(channel);
   } catch {}
   ipcMain.handle(channel, handler);
+}
+
+function getUserEnvPath() {
+  return path.join(app.getPath("userData"), ".env");
+}
+
+function ensureUserEnvTemplate() {
+  try {
+    const userEnvPath = getUserEnvPath();
+
+    if (!fsSync.existsSync(userEnvPath)) {
+      const template = [
+        "SMTP_HOST=",
+        "SMTP_PORT=587",
+        "SMTP_SECURE=false",
+        "SMTP_USER=",
+        "SMTP_PASS=",
+        "SMTP_FROM=",
+        "",
+      ].join("\n");
+
+      fsSync.writeFileSync(userEnvPath, template, "utf8");
+      console.log("[ENV] Created template .env at:", userEnvPath);
+    }
+  } catch (e) {
+    console.error("[ENV] Failed to create template .env:", e);
+  }
+}
+
+function loadEnvFiles() {
+  try {
+    const devEnvPath = path.join(__dirname, "../.env");
+    const userEnvPath = getUserEnvPath();
+
+    // 1) load project .env in dev mode if present
+    if (fsSync.existsSync(devEnvPath)) {
+      dotenv.config({ path: devEnvPath });
+      console.log("[ENV] Loaded dev .env:", devEnvPath);
+    }
+
+    // 2) always make sure userData .env exists
+    ensureUserEnvTemplate();
+
+    // 3) load userData .env and let it override dev values
+    if (fsSync.existsSync(userEnvPath)) {
+      dotenv.config({ path: userEnvPath, override: true });
+      console.log("[ENV] Loaded userData .env:", userEnvPath);
+    }
+
+    console.log("[ENV] SMTP status:", process.env.SMTP_HOST ? "configured" : "missing");
+  } catch (e) {
+    console.error("[ENV] Failed to load .env files:", e);
+  }
 }
 
 // ---------- window ----------
@@ -2179,11 +2232,10 @@ app.whenReady().then(() => {
   console.log("✅ MAIN.JS LOADED:", __filename);
 
   try {
+    loadEnvFiles();
     initDB();
     registerIpcHandlers();
-    createWindow();
-    setupAutoUpdater();
-  } catch (e) {
+    createWindow();} catch (e) {
     console.error("Startup failed:", e);
     dialog.showErrorBox(
       "RetailPOS startup failed",
