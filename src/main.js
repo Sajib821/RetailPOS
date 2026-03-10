@@ -2,8 +2,10 @@
 // Multi-store RetailPOS (SQLite + IPC + per-store users + products + sales + refunds + reports + receipts + Supabase sync)
 // + Superadmin + Stores + Fiscal Year + Customer Due/Payments + Historical Sales Import
 // + Store contact / per-store receipt footer support
+// + Auto update (GitHub Releases)
 
 const { app, BrowserWindow, ipcMain, dialog } = require("electron");
+const { autoUpdater } = require("electron-updater");
 const path = require("path");
 const crypto = require("crypto");
 const fs = require("fs/promises");
@@ -75,6 +77,14 @@ function adminOnly() {
 
 function superadminOnly() {
   return { ok: false, message: "Superadmin only" };
+}
+
+function sendToRenderer(channel, payload) {
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(channel, payload);
+    }
+  } catch {}
 }
 
 // Superadmin can temporarily "manage" another store without changing device settings
@@ -184,6 +194,91 @@ function createWindow() {
   }
 
   mainWindow.once("ready-to-show", () => mainWindow.show());
+}
+
+// ---------- auto updater ----------
+function setupAutoUpdater() {
+  if (isDev) {
+    console.log("[Updater] Disabled in development mode.");
+    return;
+  }
+
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on("checking-for-update", () => {
+    console.log("[Updater] Checking for update...");
+    sendToRenderer("updater:message", {
+      type: "info",
+      message: "Checking for updates...",
+    });
+  });
+
+  autoUpdater.on("update-available", (info) => {
+    console.log("[Updater] Update available:", info?.version);
+    sendToRenderer("updater:message", {
+      type: "info",
+      message: `Update available: ${info?.version || "new version"}`,
+      version: info?.version || null,
+    });
+  });
+
+  autoUpdater.on("update-not-available", () => {
+    console.log("[Updater] No update available.");
+    sendToRenderer("updater:message", {
+      type: "info",
+      message: "You already have the latest version.",
+    });
+  });
+
+  autoUpdater.on("download-progress", (progress) => {
+    console.log("[Updater] Download progress:", progress?.percent);
+    sendToRenderer("updater:progress", {
+      percent: Number(progress?.percent || 0),
+      bytesPerSecond: Number(progress?.bytesPerSecond || 0),
+      transferred: Number(progress?.transferred || 0),
+      total: Number(progress?.total || 0),
+    });
+  });
+
+  autoUpdater.on("update-downloaded", async (info) => {
+    console.log("[Updater] Update downloaded:", info?.version);
+
+    sendToRenderer("updater:message", {
+      type: "success",
+      message: `Update downloaded: ${info?.version || "new version"}. Restart to install.`,
+      version: info?.version || null,
+      downloaded: true,
+    });
+
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: "info",
+      buttons: ["Restart now", "Later"],
+      defaultId: 0,
+      cancelId: 1,
+      title: "Update ready",
+      message: `Version ${info?.version || ""} has been downloaded.`,
+      detail: "Restart the app to install the update.",
+    });
+
+    if (result.response === 0) {
+      autoUpdater.quitAndInstall();
+    }
+  });
+
+  autoUpdater.on("error", (err) => {
+    console.error("[Updater] Error:", err);
+    sendToRenderer("updater:message", {
+      type: "error",
+      message: err?.message || "Update error",
+    });
+  });
+
+  setTimeout(() => {
+    autoUpdater.checkForUpdatesAndNotify().catch((err) => {
+      console.error("[Updater] Initial check failed:", err);
+    });
+  }, 4000);
 }
 
 // ---------- receipt PDF ----------
@@ -345,10 +440,7 @@ function computeCustomerDueByYear(store_id, customer_id) {
   let overall = 0;
   const years = Array.from(yearMap.values())
     .map((y) => {
-      const raw =
-        Number(y.credit_sales || 0) +
-        Number(y.refunds || 0) -
-        Number(y.payments || 0);
+      const raw = Number(y.credit_sales || 0) + Number(y.refunds || 0) - Number(y.payments || 0);
       y.due = Math.max(0, raw);
       overall += y.due;
       return y;
@@ -374,6 +466,9 @@ function normalizeCategoriesTable() {
   `).all();
 
   const tx = db.transaction(() => {
+    // drop old unique index if it exists
+    db.exec("DROP INDEX IF EXISTS idx_categories_store_name_unique;");
+
     db.exec(`
       DROP TABLE IF EXISTS categories_new;
       CREATE TABLE categories_new (
@@ -575,7 +670,6 @@ function initDB() {
   ensureCol("sale_items", "profit", "REAL DEFAULT 0");
 
   db.prepare("UPDATE products SET store_id=? WHERE store_id IS NULL OR store_id=''").run(storeCtx.store_id);
-  db.prepare("UPDATE categories SET store_id=? WHERE store_id IS NULL OR store_id=''").run(storeCtx.store_id);
   db.prepare("UPDATE customers SET store_id=? WHERE store_id IS NULL OR store_id=''").run(storeCtx.store_id);
   db.prepare("UPDATE users SET store_id=? WHERE store_id IS NULL OR store_id=''").run(storeCtx.store_id);
   db.prepare("UPDATE sales SET store_id=?, store_name=COALESCE(store_name, ?) WHERE store_id IS NULL OR store_id=''")
@@ -753,10 +847,7 @@ function registerIpcHandlers() {
         7
       );
 
-      const admin = db.prepare(`
-        SELECT id FROM users WHERE store_id=? AND lower(username)='admin'
-      `).get(sid);
-
+      const admin = db.prepare("SELECT id FROM users WHERE store_id=? AND lower(username)='admin'").get(sid);
       if (!admin) {
         db.prepare(`
           INSERT INTO users (store_id, username, name, role, pin_hash)
@@ -789,7 +880,6 @@ function registerIpcHandlers() {
     const pin = String(payload?.pin || "").trim();
     const requestedStore = String(payload?.store_id || "").trim();
 
-    // (A) Superadmin
     if (username && username.toLowerCase() === "superadmin") {
       const s = getSettingsObject();
       const hash = s.superadmin_pin_hash || sha256("1111");
@@ -814,7 +904,6 @@ function registerIpcHandlers() {
       return { ok: true, user: currentUser };
     }
 
-    // (B) Username + PIN
     if (username && pin) {
       const u = username.toLowerCase();
       const h = sha256(pin);
@@ -839,7 +928,6 @@ function registerIpcHandlers() {
       return { ok: true, user: currentUser };
     }
 
-    // (C) PIN-only
     if (!username && pin) {
       const sid = effectiveStoreId();
       const h = sha256(pin);
@@ -1805,7 +1893,6 @@ function registerIpcHandlers() {
       contact: "contact",
     };
 
-    // change default/current device store
     if (k === "store_id") {
       db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run(k, v);
 
@@ -1831,7 +1918,6 @@ function registerIpcHandlers() {
       return { ok: true };
     }
 
-    // per-store keys
     if (perStoreFields[k]) {
       const sid = effectiveStoreId();
       const merged = getEffectiveSettingsObject();
@@ -1853,7 +1939,6 @@ function registerIpcHandlers() {
       const storeValue = col === "fy_start_month" ? Number(v || 7) || 7 : v;
       db.prepare(`UPDATE stores SET ${col}=? WHERE store_id=?`).run(storeValue, sid);
 
-      // keep settings table in sync for the device's own current store
       if (sid === storeCtx.store_id) {
         db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run(k, v);
         refreshStoreCtxFromSettings();
@@ -1870,7 +1955,6 @@ function registerIpcHandlers() {
       return { ok: true };
     }
 
-    // global keys
     db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run(k, v);
 
     if (["supabase_url", "supabase_key", "store_id", "store_name"].includes(k)) {
@@ -2050,6 +2134,36 @@ function registerIpcHandlers() {
       return { ok: false, message: e?.message || "Email failed" };
     }
   });
+
+  // -------------------- UPDATER --------------------
+  safeHandle("updater:check", async () => {
+    if (isDev) return { ok: false, message: "Updater disabled in dev mode" };
+
+    try {
+      const result = await autoUpdater.checkForUpdates();
+      return {
+        ok: true,
+        updateInfo: result?.updateInfo || null,
+      };
+    } catch (e) {
+      return { ok: false, message: e?.message || "Failed to check updates" };
+    }
+  });
+
+  safeHandle("updater:installNow", async () => {
+    if (isDev) return { ok: false, message: "Updater disabled in dev mode" };
+
+    try {
+      autoUpdater.quitAndInstall();
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, message: e?.message || "Failed to install update" };
+    }
+  });
+
+  safeHandle("app:getVersion", () => {
+    return app.getVersion();
+  });
 }
 
 // ---------- app ----------
@@ -2068,6 +2182,7 @@ app.whenReady().then(() => {
     initDB();
     registerIpcHandlers();
     createWindow();
+    setupAutoUpdater();
   } catch (e) {
     console.error("Startup failed:", e);
     dialog.showErrorBox(

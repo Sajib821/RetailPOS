@@ -1,6 +1,13 @@
 // src/preload.js — exposes secure IPC API to renderer
 const { contextBridge, ipcRenderer } = require("electron");
 
+function on(channel, callback) {
+  if (typeof callback !== "function") return () => {};
+  const wrapped = (_event, data) => callback(data);
+  ipcRenderer.on(channel, wrapped);
+  return () => ipcRenderer.removeListener(channel, wrapped);
+}
+
 contextBridge.exposeInMainWorld("pos", {
   // Store info (current store_id / name / currency / etc)
   store: {
@@ -19,10 +26,10 @@ contextBridge.exposeInMainWorld("pos", {
     current: () => ipcRenderer.invoke("auth:current"),
 
     // Supports:
-    // login({username:"Superadmin", pin:"1111", store_id:"store_2"})  // superadmin
-    // login({username:"admin", pin:"1234"})                          // normal
-    // login({pin:"1234"})                                           // PIN-only (if unique in store)
-    // login("admin","1234")                                         // legacy style
+    // login({username:"superadmin", pin:"1111", store_id:"store_2"})
+    // login({username:"admin", pin:"1234"})
+    // login({pin:"1234"})
+    // login("admin","1234")
     login: (username, pin) => {
       const payload =
         typeof username === "object" && username !== null ? username : { username, pin };
@@ -62,8 +69,15 @@ contextBridge.exposeInMainWorld("pos", {
     delete: (id) => ipcRenderer.invoke("customers:delete", id),
     sales: (customerId) => ipcRenderer.invoke("customers:sales", customerId),
 
-    // NEW: Due system
-    dueSummary: (customer_id) => ipcRenderer.invoke("customers:dueSummary", { customer_id }),
+    // Supports:
+    // dueSummary(5)
+    // dueSummary({ customer_id: 5 })
+    dueSummary: (arg) => {
+      const payload =
+        typeof arg === "object" && arg !== null ? arg : { customer_id: arg };
+      return ipcRenderer.invoke("customers:dueSummary", payload);
+    },
+
     history: (payload) => ipcRenderer.invoke("customers:history", payload),
     addPayment: (payload) => ipcRenderer.invoke("customers:addPayment", payload),
   },
@@ -93,13 +107,19 @@ contextBridge.exposeInMainWorld("pos", {
     getOne: (id) => ipcRenderer.invoke("sales:getOne", id),
     refund: (payload) => ipcRenderer.invoke("sales:refund", payload),
 
-    // NEW: add previous year sales history
+    // previous year / historical sales import
     addHistorical: (payload) => ipcRenderer.invoke("sales:addHistorical", payload),
   },
 
   // Reports
   reports: {
-    summary: (period) => ipcRenderer.invoke("reports:summary", { period }),
+    // supports summary("today") or summary({ period: "today" })
+    summary: (periodOrPayload) => {
+      if (typeof periodOrPayload === "object" && periodOrPayload !== null) {
+        return ipcRenderer.invoke("reports:summary", periodOrPayload);
+      }
+      return ipcRenderer.invoke("reports:summary", { period: periodOrPayload });
+    },
   },
 
   // Settings
@@ -120,5 +140,18 @@ contextBridge.exposeInMainWorld("pos", {
   receipt: {
     savePdf: (payload) => ipcRenderer.invoke("receipt:savePdf", payload),
     sendEmail: (payload) => ipcRenderer.invoke("receipt:sendEmail", payload),
+  },
+
+  // Auto updater
+  updater: {
+    check: () => ipcRenderer.invoke("updater:check"),
+    installNow: () => ipcRenderer.invoke("updater:installNow"),
+    onMessage: (callback) => on("updater:message", callback),
+    onProgress: (callback) => on("updater:progress", callback),
+  },
+
+  // App info
+  app: {
+    getVersion: () => ipcRenderer.invoke("app:getVersion"),
   },
 });
