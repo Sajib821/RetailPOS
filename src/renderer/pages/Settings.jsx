@@ -1,5 +1,88 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { usePOS } from "../App";
+
+function ConfirmDialog({
+  open,
+  title = "Confirm delete",
+  message = "Are you sure?",
+  confirmText = "Delete",
+  cancelText = "Cancel",
+  busy = false,
+  onConfirm,
+  onCancel,
+}) {
+  if (!open) return null;
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.62)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 10000,
+        padding: 16,
+      }}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !busy) onCancel?.();
+      }}
+    >
+      <div
+        style={{
+          width: 460,
+          maxWidth: "100%",
+          background: "var(--surface)",
+          border: "1px solid var(--border)",
+          borderRadius: 18,
+          boxShadow: "var(--shadow)",
+          padding: 18,
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div style={{ fontSize: 18, fontWeight: 900, color: "var(--text)" }}>{title}</div>
+        <div style={{ marginTop: 10, color: "var(--text2)", lineHeight: 1.55, whiteSpace: "pre-line" }}>
+          {message}
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 18 }}>
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid var(--border)",
+              background: "rgba(255,255,255,0.03)",
+              color: "var(--text)",
+              fontWeight: 800,
+              cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.7 : 1,
+            }}
+          >
+            {cancelText}
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={busy}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(244,63,94,0.35)",
+              background: "rgba(244,63,94,0.12)",
+              color: "#fecdd3",
+              fontWeight: 900,
+              cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.7 : 1,
+            }}
+          >
+            {busy ? "Deleting..." : confirmText}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 export default function Settings() {
   const { api, showToast, me } = usePOS();
@@ -17,15 +100,20 @@ export default function Settings() {
     supabase_key: "",
   });
 
-  const [cats, setCats] = useState([]);
-  const [newCat, setNewCat] = useState({ name: "", color: "#6366f1" });
-  const [editOpen, setEditOpen] = useState(false);
-  const [editCat, setEditCat] = useState(null);
+  const [fyRows, setFyRows] = useState([]);
+  const [newFYLabel, setNewFYLabel] = useState(`${new Date().getFullYear()}-${new Date().getFullYear() + 1}`);
+  const [newFYStartDate, setNewFYStartDate] = useState("");
+  const [newFYEndDate, setNewFYEndDate] = useState("");
+  const [confirmState, setConfirmState] = useState(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
 
   async function loadAll() {
     setLoading(true);
     try {
-      const s = await api.settings.getAll();
+      const [s, years] = await Promise.all([
+        api.settings.getAll(),
+        api.fiscalYears?.list?.().catch(() => []),
+      ]);
 
       setForm({
         store_id: s?.store_id || "store_1",
@@ -38,8 +126,7 @@ export default function Settings() {
         supabase_key: s?.supabase_key || "",
       });
 
-      const list = await api.categories.getAll();
-      setCats(list || []);
+      setFyRows(Array.isArray(years) ? years : []);
     } catch (e) {
       console.error(e);
       showToast("Failed to load settings", "error");
@@ -127,60 +214,92 @@ export default function Settings() {
     }
   }
 
-  const canAddCat = useMemo(() => newCat.name.trim().length > 0, [newCat.name]);
-
-  async function addCategory() {
-    if (!isAdmin) return showToast("Admin only", "error");
-    if (!canAddCat) return showToast("Category name required", "warning");
-
-    const res = await api.categories.create({
-      name: newCat.name.trim(),
-      color: newCat.color,
-    });
-
-    if (res?.ok === false) return showToast(res.message || "Create failed", "error");
-
-    showToast("Category created ✅");
-    setNewCat({ name: "", color: "#6366f1" });
-    setCats(await api.categories.getAll());
+  async function pushProducts() {
+    try {
+      const res = await api.sync.pushProducts();
+      const ok = !!(res?.ok ?? res);
+      showToast(ok ? "Products + categories pushed ✅" : (res?.message || "Push failed ❌"), ok ? "success" : "error");
+    } catch (e) {
+      console.error(e);
+      showToast("Push failed", "error");
+    }
   }
 
-  function openEdit(c) {
-    setEditCat({
-      id: c.id,
-      name: c.name || "",
-      color: c.color || "#6366f1",
-    });
-    setEditOpen(true);
+  async function pushAllCloud() {
+    try {
+      const res = await api.sync.pushAll();
+      const ok = !!(res?.ok ?? res);
+      showToast(ok ? "All store data pushed ✅" : (res?.message || "Full push failed ❌"), ok ? "success" : "error");
+    } catch (e) {
+      console.error(e);
+      showToast("Full push failed", "error");
+    }
   }
 
-  async function saveEdit() {
+  async function createFinancialYear() {
     if (!isAdmin) return showToast("Admin only", "error");
-    if (!editCat?.name?.trim()) return showToast("Name required", "warning");
 
-    const res = await api.categories.update({
-      id: editCat.id,
-      name: editCat.name.trim(),
-      color: editCat.color || "#6366f1",
+    const label = String(newFYLabel || "").trim();
+    const start = String(newFYStartDate || "").trim();
+    const end = String(newFYEndDate || "").trim();
+
+    if (!label || !start || !end) {
+      return showToast("Enter label, start date, and end date", "warning");
+    }
+
+    const res = await api.fiscalYears.create({
+      label,
+      start_date: start,
+      end_date: end,
     });
 
-    if (res?.ok === false) return showToast(res.message || "Update failed", "error");
+    if (res?.ok === false) {
+      return showToast(res.message || "Failed to create financial year", "error");
+    }
 
-    showToast("Category updated ✅");
-    setEditOpen(false);
-    setEditCat(null);
-    setCats(await api.categories.getAll());
+    showToast(`Financial year ${label} created ✅`);
+    setNewFYLabel(`${new Date().getFullYear()}-${new Date().getFullYear() + 1}`);
+    setNewFYStartDate("");
+    setNewFYEndDate("");
+
+    const years = await api.fiscalYears?.list?.().catch(() => []);
+    setFyRows(Array.isArray(years) ? years : []);
   }
 
-  async function deleteCat(c) {
+  async function performDeleteFinancialYear(row) {
+    setConfirmBusy(true);
+    try {
+      const res = await api.fiscalYears.delete(row.label);
+      if (res?.ok === false) {
+        return showToast(res.message || "Failed to delete financial year", "error");
+      }
+
+      showToast(`Financial year ${row.label} deleted`, "warning");
+      const years = await api.fiscalYears?.list?.().catch(() => []);
+      setFyRows(Array.isArray(years) ? years : []);
+      setConfirmState(null);
+    } finally {
+      setConfirmBusy(false);
+    }
+  }
+
+  function deleteFinancialYear(row) {
     if (!isAdmin) return showToast("Admin only", "error");
-    if (!window.confirm(`Delete category "${c.name}"?\n\nProducts in this category will be cleared.`)) return;
+    if (!row?.label) return;
 
-    const res = await api.categories.delete(c.id);
-    if (res?.ok === false) return showToast(res.message || "Delete failed", "error");
+    setConfirmState({
+      title: "Delete financial year",
+      message: `Delete financial year "${row.label}"?`,
+      confirmText: "Delete financial year",
+      onConfirm: () => performDeleteFinancialYear(row),
+    });
+  }
 
-    showToast("Category deleted", "warning");
-    setCats(await api.categories.getAll());
+  function formatFyDate(value) {
+    if (!value) return "-";
+    const d = new Date(`${String(value).slice(0, 10)}T00:00:00`);
+    if (Number.isNaN(d.getTime())) return String(value || "-");
+    return d.toLocaleDateString("en-GB");
   }
 
   return (
@@ -193,7 +312,7 @@ export default function Settings() {
             </h1>
             <div style={{ marginTop: 6, color: "var(--text2)", fontSize: 13 }}>
               {isAdmin
-                ? "Admin can edit store settings, contact, categories, and cloud sync."
+                ? "Admin can edit store settings, financial years, and cloud sync. Product categories are now managed from the Products page."
                 : "Read-only (admin only)."}
             </div>
           </div>
@@ -289,7 +408,7 @@ export default function Settings() {
             />
           </div>
 
-          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+          <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
             <button
               onClick={saveAll}
               style={btnPrimary(!isAdmin || loading)}
@@ -300,6 +419,112 @@ export default function Settings() {
             <button onClick={loadAll} style={btnGhost()} disabled={loading}>
               Reload
             </button>
+          </div>
+        </div>
+
+        <div style={{ ...card(), marginTop: 14 }}>
+          <div style={cardTitle()}>Financial years</div>
+
+          <div style={{ marginTop: 10, color: "var(--text3)", fontSize: 12, lineHeight: 1.5 }}>
+            Create and manage financial year labels here so Customer Accounts stays cleaner.
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1.2fr 1fr 1fr 220px",
+              gap: 10,
+              marginTop: 12,
+              alignItems: "end",
+            }}
+          >
+            <Field
+              label="Financial year label"
+              value={newFYLabel}
+              disabled={!isAdmin}
+              onChange={(v) => setNewFYLabel(v)}
+              placeholder="2026-2027"
+            />
+
+            <div>
+              <div style={labelStyle()}>Start date</div>
+              <input
+                type="date"
+                value={newFYStartDate}
+                disabled={!isAdmin}
+                onChange={(e) => setNewFYStartDate(e.target.value)}
+                style={inputStyle(!isAdmin)}
+              />
+            </div>
+
+            <div>
+              <div style={labelStyle()}>End date</div>
+              <input
+                type="date"
+                value={newFYEndDate}
+                disabled={!isAdmin}
+                onChange={(e) => setNewFYEndDate(e.target.value)}
+                style={inputStyle(!isAdmin)}
+              />
+            </div>
+
+            <div style={{ display: "flex", alignItems: "flex-end" }}>
+              <button
+                onClick={createFinancialYear}
+                style={btnPrimary(!isAdmin)}
+                disabled={!isAdmin}
+              >
+                Create financial year
+              </button>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 12, border: "1px solid var(--border)", borderRadius: 12, overflow: "hidden" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ background: "rgba(0,0,0,0.25)" }}>
+                  <th style={th()}>Label</th>
+                  <th style={th()}>Start date</th>
+                  <th style={th()}>End date</th>
+                  <th style={th()}>Type</th>
+                  <th style={{ ...th(), textAlign: "right" }}>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {fyRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} style={{ padding: 14, color: "var(--text2)" }}>
+                      No financial years found.
+                    </td>
+                  </tr>
+                ) : (
+                  fyRows.map((row, idx) => (
+                    <tr
+                      key={`${row.label}-${row.start_date || ""}-${idx}`}
+                      style={{
+                        borderTop: "1px solid rgba(255,255,255,0.06)",
+                        background: idx % 2 ? "rgba(255,255,255,0.02)" : "transparent",
+                      }}
+                    >
+                      <td style={td()}><b>{row.label}</b></td>
+                      <td style={td()}>{formatFyDate(row.start_date)}</td>
+                      <td style={td()}>{formatFyDate(row.end_date)}</td>
+                      <td style={td()}>{row.inferred ? "Inferred" : "Manual"}</td>
+                      <td style={{ ...td(), textAlign: "right" }}>
+                        <button
+                          onClick={() => deleteFinancialYear(row)}
+                          style={btnDanger()}
+                          disabled={!isAdmin || !!row.inferred}
+                          title={row.inferred ? "Inferred financial years cannot be deleted until related records are updated" : "Delete financial year"}
+                        >
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
           </div>
         </div>
 
@@ -340,171 +565,34 @@ export default function Settings() {
             <button onClick={testSupabase} style={btnGhost()} disabled={!isAdmin}>
               Test connection
             </button>
+            <button onClick={pushProducts} style={btnGhost()} disabled={!isAdmin}>
+              Push products + categories
+            </button>
             <button onClick={pushInventory} style={btnGhost()} disabled={!isAdmin}>
               Push inventory
+            </button>
+            <button onClick={pushAllCloud} style={btnGhost()} disabled={!isAdmin}>
+              Push all data
             </button>
           </div>
 
           <div style={{ marginTop: 10, color: "var(--text3)", fontSize: 12, lineHeight: 1.5 }}>
-            Your tills sync sales + inventory to Supabase. Use different <b>Store ID</b> per shop to separate products.
+            Automatic cloud sync covers sales, refunds, inventory, product/category changes, customers, customer payments, financial years, bank accounts, and bank transactions. Use <b>Push all data</b> once after first connection or after changing the Supabase schema.
           </div>
         </div>
 
-        <div style={{ ...card(), marginTop: 14 }}>
-          <div style={cardTitle()}>Product Categories</div>
-
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 180px 140px", gap: 10, marginTop: 12 }}>
-            <Field
-              label="New category name"
-              value={newCat.name}
-              disabled={!isAdmin}
-              onChange={(v) => setNewCat({ ...newCat, name: v })}
-              placeholder="e.g. Grocery"
-            />
-
-            <div>
-              <div style={labelStyle()}>Color</div>
-              <input
-                type="color"
-                value={newCat.color}
-                disabled={!isAdmin}
-                onChange={(e) => setNewCat({ ...newCat, color: e.target.value })}
-                style={{
-                  width: "100%",
-                  height: 42,
-                  borderRadius: 12,
-                  border: "1px solid var(--border)",
-                  background: "transparent",
-                  padding: 6,
-                  opacity: !isAdmin ? 0.65 : 1,
-                }}
-              />
-            </div>
-
-            <div style={{ display: "flex", alignItems: "flex-end" }}>
-              <button
-                onClick={addCategory}
-                style={btnPrimary(!isAdmin || !canAddCat)}
-                disabled={!isAdmin || !canAddCat}
-              >
-                Add
-              </button>
-            </div>
-          </div>
-
-          <div style={{ marginTop: 12, border: "1px solid var(--border)", borderRadius: 12, overflow: "hidden" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
-              <thead>
-                <tr style={{ background: "rgba(0,0,0,0.25)" }}>
-                  <th style={th()}>Name</th>
-                  <th style={th()}>Color</th>
-                  <th style={{ ...th(), textAlign: "right" }} />
-                </tr>
-              </thead>
-              <tbody>
-                {cats.map((c, idx) => (
-                  <tr
-                    key={c.id}
-                    style={{
-                      borderTop: "1px solid rgba(255,255,255,0.06)",
-                      background: idx % 2 ? "rgba(255,255,255,0.02)" : "transparent",
-                    }}
-                  >
-                    <td style={td()}>
-                      <b>{c.name}</b>
-                    </td>
-                    <td style={td()}>
-                      <span
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: 8,
-                          fontWeight: 900,
-                          color: "var(--text2)",
-                        }}
-                      >
-                        <span
-                          style={{
-                            width: 14,
-                            height: 14,
-                            borderRadius: 999,
-                            background: c.color || "#6366f1",
-                          }}
-                        />
-                        {c.color || "#6366f1"}
-                      </span>
-                    </td>
-                    <td style={{ ...td(), textAlign: "right" }}>
-                      <button onClick={() => openEdit(c)} style={btnGhost()} disabled={!isAdmin}>
-                        Edit
-                      </button>
-                      <button
-                        onClick={() => deleteCat(c)}
-                        style={{ ...btnDanger(), marginLeft: 8 }}
-                        disabled={!isAdmin}
-                      >
-                        Delete
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-                {cats.length === 0 && (
-                  <tr>
-                    <td colSpan={3} style={{ padding: 14, color: "var(--text2)" }}>
-                      No categories found.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        {editOpen && editCat && (
-          <div style={overlay()} onMouseDown={() => setEditOpen(false)}>
-            <div style={modal()} onMouseDown={(e) => e.stopPropagation()}>
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
-                <div style={{ fontWeight: 900, fontSize: 16 }}>Edit category</div>
-                <button onClick={() => setEditOpen(false)} style={btnGhost()}>
-                  Close
-                </button>
-              </div>
-
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 180px", gap: 10, marginTop: 12 }}>
-                <Field
-                  label="Name"
-                  value={editCat.name}
-                  onChange={(v) => setEditCat({ ...editCat, name: v })}
-                />
-                <div>
-                  <div style={labelStyle()}>Color</div>
-                  <input
-                    type="color"
-                    value={editCat.color || "#6366f1"}
-                    onChange={(e) => setEditCat({ ...editCat, color: e.target.value })}
-                    style={{
-                      width: "100%",
-                      height: 42,
-                      borderRadius: 12,
-                      border: "1px solid var(--border)",
-                      background: "transparent",
-                      padding: 6,
-                    }}
-                  />
-                </div>
-              </div>
-
-              <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 14 }}>
-                <button onClick={() => setEditOpen(false)} style={btnGhost()}>
-                  Cancel
-                </button>
-                <button onClick={saveEdit} style={btnPrimary(false)}>
-                  Save
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
+        <ConfirmDialog
+          open={!!confirmState}
+          title={confirmState?.title}
+          message={confirmState?.message}
+          confirmText={confirmState?.confirmText}
+          busy={confirmBusy}
+          onCancel={() => {
+            if (confirmBusy) return;
+            setConfirmState(null);
+          }}
+          onConfirm={() => confirmState?.onConfirm?.()}
+        />
       </div>
     </div>
   );
@@ -647,51 +735,26 @@ function btnDanger() {
     borderRadius: 12,
     border: "1px solid rgba(244,63,94,0.35)",
     background: "rgba(244,63,94,0.12)",
-    color: "white",
+    color: "#fecdd3",
     cursor: "pointer",
     fontWeight: 900,
-    whiteSpace: "nowrap",
   };
 }
 
 function th() {
   return {
-    textAlign: "left",
-    padding: "10px 12px",
-    fontSize: 12,
+    padding: "12px 14px",
     color: "var(--text2)",
+    fontSize: 12,
+    textAlign: "left",
     fontWeight: 900,
   };
 }
 
 function td() {
   return {
-    padding: "10px 12px",
-    fontSize: 13,
+    padding: "12px 14px",
     color: "var(--text)",
-  };
-}
-
-function overlay() {
-  return {
-    position: "fixed",
-    inset: 0,
-    background: "rgba(0,0,0,0.6)",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    zIndex: 9999,
-  };
-}
-
-function modal() {
-  return {
-    width: 560,
-    maxWidth: "94vw",
-    background: "var(--surface)",
-    border: "1px solid var(--border)",
-    borderRadius: 16,
-    padding: 16,
-    boxShadow: "var(--shadow)",
+    fontSize: 13,
   };
 }

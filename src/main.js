@@ -30,9 +30,17 @@ let currentUser = null; // {id, store_id, username, name, role, manage_store_id?
 let sync = {
   init: () => {},
   testConnection: async () => false,
+  syncStore: async () => {},
   syncSale: async () => {},
+  syncSalesList: async () => {},
   syncInventory: async () => {},
+  syncCustomers: async () => {},
+  syncCustomerPayments: async () => {},
+  syncFiscalYears: async () => {},
+  syncBankData: async () => {},
+  syncAllData: async () => {},
   pullSharedCatalog: async () => ({ products: [], categories: [] }),
+  pullBankData: async () => ({ accounts: [], transactions: [] }),
   pushSharedCatalog: async () => true,
 };
 
@@ -161,6 +169,135 @@ function effectiveContact() {
 
 function nowFiscalYear() {
   return fiscalYearFromDate(new Date(), effectiveFyStartMonth());
+}
+
+function normYmd(v) {
+  const raw = String(v || '').trim();
+  if (!raw) return '';
+  const d = new Date(raw.includes('T') ? raw : `${raw}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toISOString().slice(0, 10);
+}
+
+function parseSalePaymentJson(sale) {
+  try {
+    const raw = sale?.payment_json;
+    if (!raw) return {};
+    if (typeof raw === 'string') return JSON.parse(raw);
+    if (typeof raw === 'object' && raw !== null) return raw;
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+function getSalePaidAmount(sale) {
+  if ((sale?.sale_type || 'sale') === 'refund') return 0;
+
+  const total = Number(sale?.total || 0);
+  const payment = parseSalePaymentJson(sale);
+
+  const paidFromJson = Number(payment?.paidTotal);
+  if (Number.isFinite(paidFromJson) && paidFromJson > 0) {
+    return Math.min(total, Math.max(0, paidFromJson));
+  }
+
+  const status = String(sale?.status || '').toLowerCase();
+  if (status === 'completed') return total;
+
+  return 0;
+}
+
+function inferFiscalYearDates(label, startMonth = 7) {
+  const m = String(label || '').trim().match(/^(\d{4})-(\d{4})$/);
+  if (!m) return { start_date: '', end_date: '' };
+
+  const startYear = Number(m[1]);
+  const endYear = Number(m[2]);
+  if (!startYear || !endYear) return { start_date: '', end_date: '' };
+
+  const start = new Date(Date.UTC(startYear, Math.max(0, Number(startMonth || 7) - 1), 1));
+  const end = new Date(Date.UTC(endYear, Math.max(0, Number(startMonth || 7) - 1), 0));
+
+  return {
+    start_date: start.toISOString().slice(0, 10),
+    end_date: end.toISOString().slice(0, 10),
+  };
+}
+
+function listFiscalYearsForStore(store_id) {
+  const sid = String(store_id || effectiveStoreId() || '').trim();
+  const explicit = db.prepare(`
+    SELECT id, label, start_date, end_date, created_at
+    FROM fiscal_years
+    WHERE store_id=?
+    ORDER BY start_date DESC, created_at DESC
+  `).all(sid);
+
+  const byLabel = new Map();
+  explicit.forEach((row) => {
+    byLabel.set(String(row.label || '').trim(), {
+      id: row.id,
+      label: String(row.label || '').trim(),
+      start_date: String(row.start_date || '').trim(),
+      end_date: String(row.end_date || '').trim(),
+      created_at: row.created_at || null,
+      inferred: 0,
+    });
+  });
+
+  const rawLabels = db.prepare(`
+    SELECT fiscal_year AS label FROM sales WHERE store_id=? AND fiscal_year IS NOT NULL AND trim(fiscal_year)<>''
+    UNION
+    SELECT fiscal_year AS label FROM customer_payments WHERE store_id=? AND fiscal_year IS NOT NULL AND trim(fiscal_year)<>''
+  `).all(sid, sid);
+
+  const startMonth = effectiveFyStartMonth();
+
+  rawLabels.forEach((row) => {
+    const label = String(row.label || '').trim();
+    if (!label || byLabel.has(label)) return;
+    const inferred = inferFiscalYearDates(label, startMonth);
+    byLabel.set(label, {
+      id: null,
+      label,
+      start_date: inferred.start_date,
+      end_date: inferred.end_date,
+      created_at: null,
+      inferred: 1,
+    });
+  });
+
+  return Array.from(byLabel.values()).sort((a, b) => {
+    const aDate = String(a.start_date || '');
+    const bDate = String(b.start_date || '');
+    if (aDate && bDate && aDate !== bDate) return aDate < bDate ? 1 : -1;
+    return String(a.label || '') < String(b.label || '') ? 1 : -1;
+  });
+}
+
+function buildDateWhere(alias, range, fromDate, toDate) {
+  if (range === 'today') {
+    return { clause: `date(${alias}.created_at)=date('now')`, params: [] };
+  }
+
+  if (range === '7d') {
+    return { clause: `date(${alias}.created_at)>=date('now','-6 days')`, params: [] };
+  }
+
+  if (range === 'month') {
+    return { clause: `date(${alias}.created_at)>=date('now','-29 days')`, params: [] };
+  }
+
+  if (range === 'custom') {
+    const start = normYmd(fromDate);
+    const end = normYmd(toDate || fromDate);
+    if (start && end) {
+      return { clause: `date(${alias}.created_at) BETWEEN date(?) AND date(?)`, params: [start, end] };
+    }
+  }
+
+  return { clause: '1=1', params: [] };
 }
 
 function safeHandle(channel, handler) {
@@ -439,11 +576,318 @@ function initSyncFromSettings() {
 
     sync.init({ supabaseUrl, supabaseKey, storeId, storeName });
 
+    Promise.resolve(triggerStoreMetaSync(storeId)).catch(() => {});
     const products = db.prepare("SELECT * FROM products WHERE store_id=?").all(storeId);
-    Promise.resolve(sync.syncInventory(products)).catch(() => {});
+    Promise.resolve(sync.syncInventory({ storeId, storeName, products })).catch(() => {});
   } catch {
     // offline ok
   }
+}
+
+function getStoreSettingsForSync(storeId) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  const base = getSettingsObject();
+  const row = getStoreRow(sid) || {};
+
+  return {
+    store_id: sid,
+    store_name: String(row.store_name || (sid === storeCtx.store_id ? base.store_name : "") || storeCtx.store_name || sid).trim() || sid,
+    currency: String(row.currency || (sid === storeCtx.store_id ? base.currency : "") || storeCtx.currency || "BDT").trim() || "BDT",
+    fy_start_month: Number(row.fy_start_month || (sid === storeCtx.store_id ? base.fy_start_month : "") || storeCtx.fy_start_month || 7) || 7,
+    receipt_footer:
+      row.receipt_footer !== undefined && row.receipt_footer !== null
+        ? String(row.receipt_footer)
+        : String((sid === storeCtx.store_id ? base.receipt_footer : "") || "Thank you for shopping with us!"),
+    contact:
+      row.contact !== undefined && row.contact !== null
+        ? String(row.contact)
+        : String((sid === storeCtx.store_id ? base.contact : "") || ""),
+  };
+}
+
+function getCustomerPaymentsForSync(storeId) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  return db.prepare(`
+    SELECT p.*, c.name AS customer_name
+    FROM customer_payments p
+    LEFT JOIN customers c ON c.id = p.customer_id AND c.store_id = p.store_id
+    WHERE p.store_id=?
+    ORDER BY p.created_at DESC, p.id DESC
+  `).all(sid);
+}
+
+function getFiscalYearsForSync(storeId) {
+  return listFiscalYearsForStore(String(storeId || effectiveStoreId() || "").trim());
+}
+
+function getBankAccountsForSync(storeId) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  return db.prepare(`
+    SELECT *
+    FROM bank_accounts
+    WHERE store_id=?
+    ORDER BY id DESC
+  `).all(sid);
+}
+
+function getBankTransactionsForSync(storeId) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  return db.prepare(`
+    SELECT *
+    FROM bank_transactions
+    WHERE store_id=?
+    ORDER BY created_at DESC, id DESC
+  `).all(sid);
+}
+
+function getSalesForSync(storeId) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  return db.prepare(`
+    SELECT *
+    FROM sales
+    WHERE store_id=?
+    ORDER BY created_at DESC, id DESC
+  `).all(sid);
+}
+
+function getSaleItemsMapForSync(storeId) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  const rows = db.prepare(`
+    SELECT si.*
+    FROM sale_items si
+    JOIN sales s ON s.id = si.sale_id
+    WHERE s.store_id=?
+    ORDER BY si.id ASC
+  `).all(sid);
+
+  const map = {};
+  rows.forEach((row) => {
+    const key = String(row.sale_id);
+    if (!Array.isArray(map[key])) map[key] = [];
+    map[key].push(row);
+  });
+  return map;
+}
+
+function triggerStoreMetaSync(storeId = effectiveStoreId()) {
+  const store = getStoreSettingsForSync(storeId);
+  return sync.syncStore(store);
+}
+
+function triggerCatalogSync(storeId = effectiveStoreId()) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  const store = getStoreSettingsForSync(sid);
+  const categories = db.prepare("SELECT * FROM categories WHERE store_id=? ORDER BY name").all(sid);
+  const products = db.prepare("SELECT * FROM products WHERE store_id=? ORDER BY name").all(sid);
+  return sync.pushSharedCatalog({
+    storeId: sid,
+    storeName: store.store_name,
+    categories,
+    products,
+  });
+}
+
+function triggerInventorySync(storeId = effectiveStoreId()) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  const store = getStoreSettingsForSync(sid);
+  const products = db.prepare("SELECT * FROM products WHERE store_id=? ORDER BY name").all(sid);
+  return sync.syncInventory({
+    storeId: sid,
+    storeName: store.store_name,
+    products,
+  });
+}
+
+function triggerCustomersSync(storeId = effectiveStoreId()) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  const store = getStoreSettingsForSync(sid);
+  const customers = db.prepare("SELECT * FROM customers WHERE store_id=? ORDER BY id DESC").all(sid);
+  return sync.syncCustomers({
+    storeId: sid,
+    storeName: store.store_name,
+    customers,
+  });
+}
+
+function triggerCustomerPaymentsSync(storeId = effectiveStoreId()) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  const store = getStoreSettingsForSync(sid);
+  return sync.syncCustomerPayments({
+    storeId: sid,
+    storeName: store.store_name,
+    payments: getCustomerPaymentsForSync(sid),
+  });
+}
+
+function triggerFiscalYearsSync(storeId = effectiveStoreId()) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  const store = getStoreSettingsForSync(sid);
+  return sync.syncFiscalYears({
+    storeId: sid,
+    storeName: store.store_name,
+    fiscalYears: getFiscalYearsForSync(sid),
+  });
+}
+
+function triggerBankSync(storeId = effectiveStoreId()) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  const store = getStoreSettingsForSync(sid);
+  return sync.syncBankData({
+    storeId: sid,
+    storeName: store.store_name,
+    accounts: getBankAccountsForSync(sid),
+    transactions: getBankTransactionsForSync(sid),
+  });
+}
+
+function applyPulledBankDataToLocal({ storeId, accounts = [], transactions = [] } = {}) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  if (!sid) return { ok: false, message: "Missing store id" };
+
+  const safeAccounts = Array.isArray(accounts) ? accounts : [];
+  const safeTransactions = Array.isArray(transactions) ? transactions : [];
+
+  const run = db.transaction(() => {
+    db.prepare("DELETE FROM bank_transactions WHERE store_id=?").run(sid);
+    db.prepare("DELETE FROM bank_accounts WHERE store_id=?").run(sid);
+
+    const insertAccount = db.prepare(`
+      INSERT INTO bank_accounts (
+        id, store_id, account_name, bank_name, account_number, opening_balance, note, active, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), COALESCE(?, COALESCE(?, datetime('now'))))
+    `);
+
+    const insertTransaction = db.prepare(`
+      INSERT INTO bank_transactions (
+        id, store_id, account_id, type, amount, reference, note, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), COALESCE(?, COALESCE(?, datetime('now'))))
+    `);
+
+    safeAccounts
+      .map((row) => ({
+        id: Number(row?.local_id),
+        account_name: String(row?.account_name || "").trim(),
+        bank_name: String(row?.bank_name || "").trim(),
+        account_number: String(row?.account_number || "").trim(),
+        opening_balance: Number(row?.opening_balance || 0),
+        note: row?.note == null ? "" : String(row.note),
+        active: Number(row?.active === undefined ? 1 : row.active) ? 1 : 0,
+        created_at: row?.created_at || null,
+        updated_at: row?.updated_at || row?.created_at || null,
+      }))
+      .filter((row) => row.id && row.account_name)
+      .sort((a, b) => a.id - b.id)
+      .forEach((row) => {
+        insertAccount.run(
+          row.id,
+          sid,
+          row.account_name,
+          row.bank_name || "",
+          row.account_number || "",
+          row.opening_balance,
+          row.note,
+          row.active,
+          row.created_at,
+          row.updated_at,
+          row.created_at
+        );
+      });
+
+    safeTransactions
+      .map((row) => ({
+        id: Number(row?.local_id),
+        account_id: Number(row?.local_account_id),
+        type: String(row?.type || "credit").trim().toLowerCase() === "debit" ? "debit" : "credit",
+        amount: Number(row?.amount || 0),
+        reference: row?.reference == null ? "" : String(row.reference),
+        note: row?.note == null ? "" : String(row.note),
+        created_at: row?.created_at || null,
+        updated_at: row?.updated_at || row?.created_at || null,
+      }))
+      .filter((row) => row.id && row.account_id && row.amount > 0)
+      .sort((a, b) => a.id - b.id)
+      .forEach((row) => {
+        insertTransaction.run(
+          row.id,
+          sid,
+          row.account_id,
+          row.type,
+          row.amount,
+          row.reference,
+          row.note,
+          row.created_at,
+          row.updated_at,
+          row.created_at
+        );
+      });
+  });
+
+  run();
+  return { ok: true };
+}
+
+async function triggerBankPull(storeId = effectiveStoreId()) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  if (!sid || !sync?.pullBankData) return { ok: false, message: "Bank pull not available" };
+
+  const pulled = await sync.pullBankData({ storeId: sid });
+  applyPulledBankDataToLocal({
+    storeId: sid,
+    accounts: pulled?.accounts || [],
+    transactions: pulled?.transactions || [],
+  });
+
+  return {
+    ok: true,
+    accounts: Array.isArray(pulled?.accounts) ? pulled.accounts.length : 0,
+    transactions: Array.isArray(pulled?.transactions) ? pulled.transactions.length : 0,
+  };
+}
+
+let bankAutoPullTimer = null;
+
+function startBankAutoPull() {
+  try {
+    if (bankAutoPullTimer) clearInterval(bankAutoPullTimer);
+  } catch {}
+  bankAutoPullTimer = setInterval(() => {
+    if (!currentUser) return;
+    Promise.resolve(triggerBankPull()).catch(() => {});
+  }, 15000);
+}
+
+function stopBankAutoPull() {
+  try {
+    if (bankAutoPullTimer) clearInterval(bankAutoPullTimer);
+  } catch {}
+  bankAutoPullTimer = null;
+}
+
+function triggerFullSync(storeId = effectiveStoreId()) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  const store = getStoreSettingsForSync(sid);
+  const categories = db.prepare("SELECT * FROM categories WHERE store_id=? ORDER BY name").all(sid);
+  const products = db.prepare("SELECT * FROM products WHERE store_id=? ORDER BY name").all(sid);
+  const customers = db.prepare("SELECT * FROM customers WHERE store_id=? ORDER BY id DESC").all(sid);
+  const customerPayments = getCustomerPaymentsForSync(sid);
+  const fiscalYears = getFiscalYearsForSync(sid);
+  const bankAccounts = getBankAccountsForSync(sid);
+  const bankTransactions = getBankTransactionsForSync(sid);
+  const sales = getSalesForSync(sid);
+  const saleItemsBySaleId = getSaleItemsMapForSync(sid);
+
+  return sync.syncAllData({
+    store,
+    categories,
+    products,
+    customers,
+    customerPayments,
+    fiscalYears,
+    bankAccounts,
+    bankTransactions,
+    sales,
+    saleItemsBySaleId,
+  });
 }
 
 // ---------- customer due ----------
@@ -451,7 +895,7 @@ function computeCustomerDueByYear(store_id, customer_id) {
   const fyStart = effectiveFyStartMonth();
 
   const dueSales = db.prepare(`
-    SELECT id, fiscal_year, total, sale_type, status, created_at
+    SELECT id, fiscal_year, total, sale_type, status, created_at, payment_json
     FROM sales
     WHERE store_id=? AND customer_id=? AND status='due'
   `).all(store_id, customer_id);
@@ -480,8 +924,13 @@ function computeCustomerDueByYear(store_id, customer_id) {
   for (const s of dueSales) {
     const fy = s.fiscal_year || fiscalYearFromDate(parseDateLoose(s.created_at), fyStart);
     const y = addYear(fy);
-    if ((s.sale_type || "sale") === "refund") y.refunds += Number(s.total || 0);
-    else y.credit_sales += Number(s.total || 0);
+
+    if ((s.sale_type || 'sale') === 'refund') {
+      y.refunds += Number(s.total || 0);
+    } else {
+      y.credit_sales += Number(s.total || 0);
+      y.payments += Number(getSalePaidAmount(s) || 0);
+    }
   }
 
   for (const p of payments) {
@@ -685,6 +1134,32 @@ function initDB() {
       cashier_id INTEGER,
       cashier_name TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS bank_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      store_id TEXT NOT NULL,
+      account_name TEXT NOT NULL,
+      bank_name TEXT DEFAULT '',
+      account_number TEXT DEFAULT '',
+      opening_balance REAL DEFAULT 0,
+      note TEXT DEFAULT '',
+      active INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS bank_transactions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      store_id TEXT NOT NULL,
+      account_id INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      amount REAL NOT NULL,
+      reference TEXT DEFAULT '',
+      note TEXT DEFAULT '',
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (account_id) REFERENCES bank_accounts(id) ON DELETE CASCADE
+    );
   `);
 
   const ensureCol = (table, col, def) => {
@@ -711,6 +1186,17 @@ function initDB() {
   ensureCol("sales", "store_name", "TEXT");
   ensureCol("sales", "fiscal_year", "TEXT");
   ensureCol("sales", "payment_json", "TEXT");
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS fiscal_years (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      store_id TEXT NOT NULL,
+      label TEXT NOT NULL,
+      start_date TEXT NOT NULL,
+      end_date TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
   ensureCol("sales", "sale_type", "TEXT DEFAULT 'sale'");
   ensureCol("sales", "original_sale_id", "INTEGER");
   ensureCol("sales", "customer_id", "INTEGER");
@@ -721,6 +1207,15 @@ function initDB() {
 
   ensureCol("sale_items", "cost", "REAL DEFAULT 0");
   ensureCol("sale_items", "profit", "REAL DEFAULT 0");
+  ensureCol("bank_accounts", "bank_name", "TEXT DEFAULT ''");
+  ensureCol("bank_accounts", "account_number", "TEXT DEFAULT ''");
+  ensureCol("bank_accounts", "opening_balance", "REAL DEFAULT 0");
+  ensureCol("bank_accounts", "note", "TEXT DEFAULT ''");
+  ensureCol("bank_accounts", "active", "INTEGER DEFAULT 1");
+  ensureCol("bank_accounts", "updated_at", "TEXT DEFAULT (datetime('now'))");
+  ensureCol("bank_transactions", "reference", "TEXT DEFAULT ''");
+  ensureCol("bank_transactions", "note", "TEXT DEFAULT ''");
+  ensureCol("bank_transactions", "updated_at", "TEXT DEFAULT (datetime('now'))");
 
   db.prepare("UPDATE products SET store_id=? WHERE store_id IS NULL OR store_id=''").run(storeCtx.store_id);
   db.prepare("UPDATE customers SET store_id=? WHERE store_id IS NULL OR store_id=''").run(storeCtx.store_id);
@@ -815,6 +1310,11 @@ function initDB() {
 
     CREATE INDEX IF NOT EXISTS idx_payments_store_customer_year ON customer_payments(store_id, customer_id, fiscal_year);
     CREATE INDEX IF NOT EXISTS idx_payments_created_at ON customer_payments(created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_fiscal_years_store_label_unique ON fiscal_years(store_id, label);
+    CREATE INDEX IF NOT EXISTS idx_fiscal_years_store_dates ON fiscal_years(store_id, start_date, end_date);
+    CREATE INDEX IF NOT EXISTS idx_bank_accounts_store_id ON bank_accounts(store_id);
+    CREATE INDEX IF NOT EXISTS idx_bank_transactions_account_created ON bank_transactions(account_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_bank_transactions_store_id ON bank_transactions(store_id);
   `);
 
   const seedCategories = [
@@ -908,13 +1408,15 @@ function registerIpcHandlers() {
         `).run(sid, "admin", "Admin", "admin", sha256("1234"));
       }
 
+      Promise.resolve(triggerStoreMetaSync(sid)).catch(() => {});
+      Promise.resolve(triggerFiscalYearsSync(sid)).catch(() => {});
       return { ok: true };
     } catch {
       return { ok: false, message: "Store ID already exists" };
     }
   });
 
-  safeHandle("stores:setActive", (_, { store_id }) => {
+  safeHandle("stores:setActive", async (_, { store_id }) => {
     if (!isSuperadmin()) return superadminOnly();
 
     const sid = String(store_id || "").trim();
@@ -922,6 +1424,8 @@ function registerIpcHandlers() {
     if (!st) return { ok: false, message: "Store not found" };
 
     currentUser.manage_store_id = sid;
+    Promise.resolve(triggerBankPull(sid)).catch(() => {});
+    startBankAutoPull();
     return { ok: true, store: st };
   });
 
@@ -954,6 +1458,12 @@ function registerIpcHandlers() {
         currentUser.manage_store_id = requestedStore;
       }
 
+      Promise.resolve(triggerBankPull(effectiveStoreId())).catch(() => {});
+      startBankAutoPull();
+      Promise.resolve(triggerBankPull(effectiveStoreId())).catch(() => {});
+      startBankAutoPull();
+      Promise.resolve(triggerBankPull(effectiveStoreId())).catch(() => {});
+      startBankAutoPull();
       return { ok: true, user: currentUser };
     }
 
@@ -1015,6 +1525,7 @@ function registerIpcHandlers() {
   });
 
   safeHandle("auth:logout", () => {
+    stopBankAutoPull();
     currentUser = null;
     return { ok: true };
   });
@@ -1176,6 +1687,224 @@ function registerIpcHandlers() {
   });
 
   // -------------------- CUSTOMERS --------------------
+  safeHandle("fiscalYears:list", () => {
+    return listFiscalYearsForStore(effectiveStoreId());
+  });
+
+  safeHandle("fiscalYears:create", (_, payload = {}) => {
+    if (!isAdmin()) return adminOnly();
+
+    const sid = effectiveStoreId();
+    const label = String(payload.label || '').trim();
+    const start_date = normYmd(payload.start_date);
+    const end_date = normYmd(payload.end_date);
+
+    if (!label || !start_date || !end_date) {
+      return { ok: false, message: 'Label, start date, and end date are required' };
+    }
+
+    if (start_date > end_date) {
+      return { ok: false, message: 'Start date must be before end date' };
+    }
+
+    try {
+      db.prepare(`
+        INSERT INTO fiscal_years (store_id, label, start_date, end_date)
+        VALUES (?, ?, ?, ?)
+      `).run(sid, label, start_date, end_date);
+      return { ok: true };
+    } catch {
+      return { ok: false, message: 'Financial year label already exists' };
+    }
+  });
+
+  safeHandle("fiscalYears:delete", (_, label) => {
+    if (!isAdmin()) return adminOnly();
+
+    const sid = effectiveStoreId();
+    db.prepare(`
+      DELETE FROM fiscal_years
+      WHERE store_id=? AND label=?
+    `).run(sid, String(label || '').trim());
+
+    Promise.resolve(triggerFiscalYearsSync(sid)).catch(() => {});
+    return { ok: true };
+  });
+
+
+  // -------------------- BANK ACCOUNTS --------------------
+  safeHandle("bankAccounts:list", async () => {
+    if (!isAdmin()) return adminOnly();
+
+    const sid = effectiveStoreId();
+    await Promise.resolve(triggerBankPull(sid)).catch(() => {});
+    const rows = db.prepare(`
+      SELECT
+        a.*,
+        COALESCE(SUM(CASE WHEN t.type='credit' THEN t.amount ELSE 0 END), 0) AS total_credit,
+        COALESCE(SUM(CASE WHEN t.type='debit' THEN t.amount ELSE 0 END), 0) AS total_debit
+      FROM bank_accounts a
+      LEFT JOIN bank_transactions t ON t.account_id = a.id
+      WHERE a.store_id=? AND COALESCE(a.active,1)=1
+      GROUP BY a.id
+      ORDER BY lower(a.account_name) ASC, a.id DESC
+    `).all(sid);
+
+    return rows.map((row) => ({
+      ...row,
+      opening_balance: Number(row.opening_balance || 0),
+      total_credit: Number(row.total_credit || 0),
+      total_debit: Number(row.total_debit || 0),
+      current_balance:
+        Number(row.opening_balance || 0) + Number(row.total_credit || 0) - Number(row.total_debit || 0),
+    }));
+  });
+
+  safeHandle("bankAccounts:create", (_, payload = {}) => {
+    if (!isAdmin()) return adminOnly();
+
+    const sid = effectiveStoreId();
+    const account_name = String(payload.account_name || "").trim();
+    const bank_name = String(payload.bank_name || "").trim();
+    const account_number = String(payload.account_number || "").trim();
+    const opening_balance = Number(payload.opening_balance || 0);
+    const note = String(payload.note || "").trim();
+
+    if (!account_name) return { ok: false, message: "Account name required" };
+    if (!Number.isFinite(opening_balance)) return { ok: false, message: "Invalid opening balance" };
+
+    const r = db.prepare(`
+      INSERT INTO bank_accounts (
+        store_id, account_name, bank_name, account_number, opening_balance, note, active, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'))
+    `).run(sid, account_name, bank_name, account_number, opening_balance, note);
+
+    Promise.resolve(triggerBankSync(sid)).catch(() => {});
+    return { ok: true, id: r.lastInsertRowid };
+  });
+
+  safeHandle("bankAccounts:update", (_, payload = {}) => {
+    if (!isAdmin()) return adminOnly();
+
+    const sid = effectiveStoreId();
+    const id = Number(payload.id);
+    const account_name = String(payload.account_name || "").trim();
+    const bank_name = String(payload.bank_name || "").trim();
+    const account_number = String(payload.account_number || "").trim();
+    const opening_balance = Number(payload.opening_balance || 0);
+    const note = String(payload.note || "").trim();
+
+    if (!id) return { ok: false, message: "Missing account id" };
+    if (!account_name) return { ok: false, message: "Account name required" };
+    if (!Number.isFinite(opening_balance)) return { ok: false, message: "Invalid opening balance" };
+
+    db.prepare(`
+      UPDATE bank_accounts
+      SET account_name=?, bank_name=?, account_number=?, opening_balance=?, note=?, updated_at=datetime('now')
+      WHERE id=? AND store_id=?
+    `).run(account_name, bank_name, account_number, opening_balance, note, id, sid);
+
+    Promise.resolve(triggerBankSync(sid)).catch(() => {});
+    return { ok: true };
+  });
+
+  safeHandle("bankAccounts:delete", (_, id) => {
+    if (!isAdmin()) return adminOnly();
+
+    const sid = effectiveStoreId();
+    const accountId = Number(id);
+    if (!accountId) return { ok: false, message: "Missing account id" };
+
+    const row = db.prepare("SELECT id FROM bank_accounts WHERE id=? AND store_id=?").get(accountId, sid);
+    if (!row) return { ok: false, message: "Bank account not found" };
+
+    db.prepare("DELETE FROM bank_transactions WHERE account_id=? AND store_id=?").run(accountId, sid);
+    db.prepare("DELETE FROM bank_accounts WHERE id=? AND store_id=?").run(accountId, sid);
+    Promise.resolve(triggerBankSync(sid)).catch(() => {});
+    return { ok: true };
+  });
+
+  safeHandle("bankAccounts:transactions", async (_, accountId) => {
+    if (!isAdmin()) return adminOnly();
+
+    const sid = effectiveStoreId();
+    await Promise.resolve(triggerBankPull(sid)).catch(() => {});
+    const aid = Number(accountId);
+    if (!aid) return [];
+
+    return db.prepare(`
+      SELECT *
+      FROM bank_transactions
+      WHERE store_id=? AND account_id=?
+      ORDER BY datetime(created_at) DESC, id DESC
+    `).all(sid, aid);
+  });
+
+  safeHandle("bankAccounts:createTransaction", (_, payload = {}) => {
+    if (!isAdmin()) return adminOnly();
+
+    const sid = effectiveStoreId();
+    const account_id = Number(payload.account_id);
+    const type = String(payload.type || "credit").trim().toLowerCase() === "debit" ? "debit" : "credit";
+    const amount = Number(payload.amount || 0);
+    const reference = String(payload.reference || "").trim();
+    const note = String(payload.note || "").trim();
+    const created_at = String(payload.created_at || "").trim() || null;
+
+    if (!account_id) return { ok: false, message: "Bank account required" };
+    if (!(amount > 0)) return { ok: false, message: "Amount must be greater than zero" };
+
+    const account = db.prepare("SELECT id FROM bank_accounts WHERE id=? AND store_id=?").get(account_id, sid);
+    if (!account) return { ok: false, message: "Bank account not found" };
+
+    const r = db.prepare(`
+      INSERT INTO bank_transactions (
+        store_id, account_id, type, amount, reference, note, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), datetime('now'))
+    `).run(sid, account_id, type, amount, reference, note, created_at);
+
+    Promise.resolve(triggerBankSync(sid)).catch(() => {});
+    return { ok: true, id: r.lastInsertRowid };
+  });
+
+  safeHandle("bankAccounts:updateTransaction", (_, payload = {}) => {
+    if (!isAdmin()) return adminOnly();
+
+    const sid = effectiveStoreId();
+    const id = Number(payload.id);
+    const account_id = Number(payload.account_id);
+    const type = String(payload.type || "credit").trim().toLowerCase() === "debit" ? "debit" : "credit";
+    const amount = Number(payload.amount || 0);
+    const reference = String(payload.reference || "").trim();
+    const note = String(payload.note || "").trim();
+    const created_at = String(payload.created_at || "").trim() || null;
+
+    if (!id) return { ok: false, message: "Missing transaction id" };
+    if (!account_id) return { ok: false, message: "Bank account required" };
+    if (!(amount > 0)) return { ok: false, message: "Amount must be greater than zero" };
+
+    db.prepare(`
+      UPDATE bank_transactions
+      SET account_id=?, type=?, amount=?, reference=?, note=?, created_at=COALESCE(?, created_at), updated_at=datetime('now')
+      WHERE id=? AND store_id=?
+    `).run(account_id, type, amount, reference, note, created_at, id, sid);
+
+    Promise.resolve(triggerBankSync(sid)).catch(() => {});
+    return { ok: true };
+  });
+
+  safeHandle("bankAccounts:deleteTransaction", (_, id) => {
+    if (!isAdmin()) return adminOnly();
+
+    const sid = effectiveStoreId();
+    const txId = Number(id);
+    if (!txId) return { ok: false, message: "Missing transaction id" };
+
+    db.prepare("DELETE FROM bank_transactions WHERE id=? AND store_id=?").run(txId, sid);
+    Promise.resolve(triggerBankSync(sid)).catch(() => {});
+    return { ok: true };
+  });
+
   safeHandle("customers:getAll", () => {
     return db.prepare("SELECT * FROM customers WHERE store_id=? ORDER BY id DESC")
       .all(effectiveStoreId());
@@ -1231,6 +1960,7 @@ function registerIpcHandlers() {
   safeHandle("customers:delete", (_, id) => {
     const sid = effectiveStoreId();
     db.prepare("DELETE FROM customers WHERE id=? AND store_id=?").run(Number(id), sid);
+    Promise.resolve(triggerCustomersSync(sid)).catch(() => {});
     return { ok: true };
   });
 
@@ -1253,38 +1983,54 @@ function registerIpcHandlers() {
     return { ok: true, customer, ...due };
   });
 
-  safeHandle("customers:history", (_, { customer_id, range, fiscal_year } = {}) => {
+  safeHandle("customers:history", (_, {
+    customer_id,
+    range,
+    fiscal_year,
+    from_date,
+    to_date,
+  } = {}) => {
     const sid = effectiveStoreId();
     const cid = Number(customer_id);
     const fy = String(fiscal_year || "").trim();
 
-    let where = "1=1";
-    if (range === "today") where = "date(created_at)=date('now')";
-    if (range === "7d") where = "date(created_at)>=date('now','-7 days')";
-    if (range === "month") where = "date(created_at)>=date('now','-30 days')";
-    if (range === "fy" && fy) where = "fiscal_year=?";
+    const salesWhere = ["store_id=?", "customer_id=?"];
+    const salesParams = [sid, cid];
 
-    const salesSql = `
-      SELECT * FROM sales
-      WHERE store_id=? AND customer_id=? AND ${where}
+    const payWhere = ["store_id=?", "customer_id=?"];
+    const payParams = [sid, cid];
+
+    if (fy) {
+      salesWhere.push("COALESCE(fiscal_year,'')=?");
+      salesParams.push(fy);
+
+      payWhere.push("fiscal_year=?");
+      payParams.push(fy);
+    }
+
+    const salesDate = buildDateWhere("s", range, from_date, to_date);
+    if (salesDate.clause !== "1=1") {
+      salesWhere.push(salesDate.clause);
+      salesParams.push(...salesDate.params);
+    }
+
+    const payDate = buildDateWhere("p", range, from_date, to_date);
+    if (payDate.clause !== "1=1") {
+      payWhere.push(payDate.clause);
+      payParams.push(...payDate.params);
+    }
+
+    const sales = db.prepare(`
+      SELECT * FROM sales s
+      WHERE ${salesWhere.join(" AND ")}
       ORDER BY created_at DESC
-    `;
+    `).all(...salesParams);
 
-    const sales =
-      range === "fy" && fy
-        ? db.prepare(salesSql).all(sid, cid, fy)
-        : db.prepare(salesSql).all(sid, cid);
-
-    const paymentsSql = `
-      SELECT * FROM customer_payments
-      WHERE store_id=? AND customer_id=? ${range === "fy" && fy ? "AND fiscal_year=?" : ""}
+    const payments = db.prepare(`
+      SELECT * FROM customer_payments p
+      WHERE ${payWhere.join(" AND ")}
       ORDER BY created_at DESC
-    `;
-
-    const payments =
-      range === "fy" && fy
-        ? db.prepare(paymentsSql).all(sid, cid, fy)
-        : db.prepare(paymentsSql).all(sid, cid);
+    `).all(...payParams);
 
     return { ok: true, sales, payments };
   });
@@ -1353,6 +2099,9 @@ function registerIpcHandlers() {
       emailMsg = send.ok ? null : send.message;
     }
 
+    Promise.resolve(triggerCustomerPaymentsSync(sid)).catch(() => {});
+    Promise.resolve(triggerCustomersSync(sid)).catch(() => {});
+
     return {
       ok: true,
       payment_id: r.lastInsertRowid,
@@ -1414,6 +2163,11 @@ function registerIpcHandlers() {
       0,
       created_at
     );
+
+    try {
+      const fullSale = db.prepare("SELECT * FROM sales WHERE id=?").get(r.lastInsertRowid);
+      Promise.resolve(sync.syncSale({ storeId: sid, storeName, sale: fullSale, items: [] })).catch(() => {});
+    } catch {}
 
     return { ok: true, saleId: r.lastInsertRowid };
   });
@@ -1509,9 +2263,8 @@ function registerIpcHandlers() {
     try {
       const fullSale = db.prepare("SELECT * FROM sales WHERE id=?").get(saleId);
       const saleItems = db.prepare("SELECT * FROM sale_items WHERE sale_id=?").all(saleId);
-      Promise.resolve(sync.syncSale(fullSale, saleItems)).catch(() => {});
-      const all = db.prepare("SELECT * FROM products WHERE store_id=?").all(sid);
-      Promise.resolve(sync.syncInventory(all)).catch(() => {});
+      Promise.resolve(sync.syncSale({ storeId: sid, storeName, sale: fullSale, items: saleItems })).catch(() => {});
+      Promise.resolve(triggerInventorySync(sid)).catch(() => {});
     } catch {}
 
     return { ok: true, saleId };
@@ -1699,9 +2452,8 @@ function registerIpcHandlers() {
     try {
       const refundSale = db.prepare("SELECT * FROM sales WHERE id=?").get(res.refundSaleId);
       const refundItems = db.prepare("SELECT * FROM sale_items WHERE sale_id=?").all(res.refundSaleId);
-      Promise.resolve(sync.syncSale(refundSale, refundItems)).catch(() => {});
-      const all = db.prepare("SELECT * FROM products WHERE store_id=?").all(sid);
-      Promise.resolve(sync.syncInventory(all)).catch(() => {});
+      Promise.resolve(sync.syncSale({ storeId: sid, storeName, sale: refundSale, items: refundItems })).catch(() => {});
+      Promise.resolve(triggerInventorySync(sid)).catch(() => {});
     } catch {}
 
     return res;
@@ -1744,8 +2496,8 @@ function registerIpcHandlers() {
       p.barcode || ""
     );
 
-    const all = db.prepare("SELECT * FROM products WHERE store_id=?").all(sid);
-    Promise.resolve(sync.syncInventory(all)).catch(() => {});
+    Promise.resolve(triggerInventorySync(sid)).catch(() => {});
+    Promise.resolve(triggerCatalogSync(sid)).catch(() => {});
 
     return { ok: true, id: r.lastInsertRowid };
   });
@@ -1772,8 +2524,8 @@ function registerIpcHandlers() {
       sid
     );
 
-    const all = db.prepare("SELECT * FROM products WHERE store_id=?").all(sid);
-    Promise.resolve(sync.syncInventory(all)).catch(() => {});
+    Promise.resolve(triggerInventorySync(sid)).catch(() => {});
+    Promise.resolve(triggerCatalogSync(sid)).catch(() => {});
 
     return { ok: true };
   });
@@ -1784,8 +2536,8 @@ function registerIpcHandlers() {
     const sid = effectiveStoreId();
     db.prepare("DELETE FROM products WHERE id=? AND store_id=?").run(Number(id), sid);
 
-    const all = db.prepare("SELECT * FROM products WHERE store_id=?").all(sid);
-    Promise.resolve(sync.syncInventory(all)).catch(() => {});
+    Promise.resolve(triggerInventorySync(sid)).catch(() => {});
+    Promise.resolve(triggerCatalogSync(sid)).catch(() => {});
 
     return { ok: true };
   });
@@ -1807,6 +2559,8 @@ function registerIpcHandlers() {
 
     try {
       db.prepare("INSERT INTO categories (store_id,name,color) VALUES (?,?,?)").run(sid, name, color);
+      Promise.resolve(triggerCatalogSync(sid)).catch(() => {});
+      Promise.resolve(triggerInventorySync(sid)).catch(() => {});
       return { ok: true };
     } catch {
       return { ok: false, message: "Category already exists in this store" };
@@ -1840,6 +2594,8 @@ function registerIpcHandlers() {
     });
 
     tx();
+    Promise.resolve(triggerCatalogSync(sid)).catch(() => {});
+    Promise.resolve(triggerInventorySync(sid)).catch(() => {});
     return { ok: true };
   });
 
@@ -1865,6 +2621,8 @@ function registerIpcHandlers() {
     });
 
     tx();
+    Promise.resolve(triggerCatalogSync(sid)).catch(() => {});
+    Promise.resolve(triggerInventorySync(sid)).catch(() => {});
     return { ok: true };
   });
 
@@ -1872,15 +2630,36 @@ function registerIpcHandlers() {
   safeHandle("reports:summary", (_, arg = {}) => {
     const sid = effectiveStoreId();
     const period = typeof arg === "string" ? arg : arg?.period || "today";
+    const fy = String(arg?.fiscal_year || "").trim();
+    const from_date = arg?.from_date;
+    const to_date = arg?.to_date;
 
-    const filters = {
-      today: "date(s.created_at)=date('now')",
-      week: "date(s.created_at)>=date('now','-7 days')",
-      month: "date(s.created_at)>=date('now','-30 days')",
-      year: "date(s.created_at)>=date('now','-365 days')",
-    };
+    const where = ["s.store_id=?", "s.status IN ('completed','due')"];
+    const params = [sid];
 
-    const where = filters[period] || filters.today;
+    if (fy) {
+      where.push("COALESCE(s.fiscal_year,'')=?");
+      params.push(fy);
+    }
+
+    if (period === "today") {
+      where.push("date(s.created_at)=date('now')");
+    } else if (period === "week") {
+      where.push("date(s.created_at)>=date('now','-6 days')");
+    } else if (period === "month") {
+      where.push("date(s.created_at)>=date('now','-29 days')");
+    } else if (period === "custom") {
+      const start = normYmd(from_date);
+      const end = normYmd(to_date || from_date);
+      if (start && end) {
+        where.push("date(s.created_at) BETWEEN date(?) AND date(?)");
+        params.push(start, end);
+      }
+    } else if (period === "year" && !fy) {
+      where.push("date(s.created_at)>=date('now','-365 days')");
+    }
+
+    const whereSql = where.join(" AND ");
 
     const summary = db.prepare(`
       SELECT
@@ -1889,8 +2668,8 @@ function registerIpcHandlers() {
         SUM(CASE WHEN s.sale_type='refund' THEN s.total ELSE 0 END) AS refunds,
         SUM(s.gross_profit) AS gross_profit
       FROM sales s
-      WHERE s.store_id=? AND ${where} AND s.status IN ('completed','due')
-    `).get(sid);
+      WHERE ${whereSql}
+    `).get(...params);
 
     const topProducts = db.prepare(`
       SELECT
@@ -1900,11 +2679,11 @@ function registerIpcHandlers() {
         SUM(si.profit) AS profit
       FROM sale_items si
       JOIN sales s ON si.sale_id=s.id
-      WHERE s.store_id=? AND ${where} AND s.status IN ('completed','due')
+      WHERE ${whereSql}
       GROUP BY si.product_id, si.product_name
       ORDER BY revenue DESC
       LIMIT 10
-    `).all(sid);
+    `).all(...params);
 
     const byDay = db.prepare(`
       SELECT
@@ -1914,10 +2693,10 @@ function registerIpcHandlers() {
         SUM(s.gross_profit) AS profit,
         COUNT(*) AS transactions
       FROM sales s
-      WHERE s.store_id=? AND ${where} AND s.status IN ('completed','due')
+      WHERE ${whereSql}
       GROUP BY day
       ORDER BY day
-    `).all(sid);
+    `).all(...params);
 
     const lowStock = db.prepare(`
       SELECT * FROM products
@@ -2005,6 +2784,7 @@ function registerIpcHandlers() {
         }
       }
 
+      Promise.resolve(triggerStoreMetaSync(sid)).catch(() => {});
       return { ok: true };
     }
 
@@ -2012,10 +2792,192 @@ function registerIpcHandlers() {
 
     if (["supabase_url", "supabase_key", "store_id", "store_name"].includes(k)) {
       initSyncFromSettings();
+      Promise.resolve(triggerStoreMetaSync((getSettingsObject().store_id || storeCtx.store_id || effectiveStoreId()))).catch(() => {});
     }
 
     return { ok: true };
   });
+
+
+function parsePendingChangePayload(raw) {
+  try {
+    if (!raw) return {};
+    if (typeof raw === "string") return JSON.parse(raw);
+    if (typeof raw === "object") return raw;
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+function findLocalProductForChange(sid, payload = {}, fallbackLocalId = null) {
+  const explicitId = Number(payload.local_product_id || payload.product_id || fallbackLocalId || 0);
+  const sku = String(payload.sku || "").trim();
+  const barcode = String(payload.barcode || "").trim();
+
+  if (explicitId) {
+    const byId = db.prepare("SELECT * FROM products WHERE store_id=? AND id=?").get(sid, explicitId);
+    if (byId) return byId;
+  }
+
+  if (sku) {
+    const bySku = db.prepare("SELECT * FROM products WHERE store_id=? AND sku=?").get(sid, sku);
+    if (bySku) return bySku;
+  }
+
+  if (barcode) {
+    const byBarcode = db.prepare("SELECT * FROM products WHERE store_id=? AND barcode=?").get(sid, barcode);
+    if (byBarcode) return byBarcode;
+  }
+
+  return null;
+}
+
+function applyPendingManagerChange(change, reviewerName = "") {
+  const sid = effectiveStoreId();
+  if (!change || String(change.store_id || "").trim() !== sid) {
+    return { ok: false, message: "Change does not belong to the active store" };
+  }
+
+  const payload = parsePendingChangePayload(change.payload);
+  const entityType = String(change.entity_type || "").trim().toLowerCase();
+
+  if (!entityType) return { ok: false, message: "Invalid change request type" };
+
+  if (entityType === "product_update") {
+    const product = findLocalProductForChange(sid, payload, change.entity_local_id);
+    if (!product) return { ok: false, message: "Product not found in desktop POS" };
+
+    const nextName = payload.name === undefined ? product.name : String(payload.name || "").trim();
+    const nextSku = payload.sku === undefined ? product.sku : String(payload.sku || "").trim();
+    const nextCategory = payload.category === undefined ? product.category : String(payload.category || "").trim();
+    const nextPrice = payload.price === undefined ? Number(product.price || 0) : Number(payload.price || 0);
+    const nextCost = payload.cost === undefined ? Number(product.cost || 0) : Number(payload.cost || 0);
+    const nextStock = payload.stock === undefined ? Number(product.stock || 0) : Number(payload.stock || 0);
+    const nextThreshold = payload.low_stock_threshold === undefined
+      ? Number(product.low_stock_threshold || 5)
+      : Number(payload.low_stock_threshold || 5);
+    const nextBarcode = payload.barcode === undefined ? String(product.barcode || "") : String(payload.barcode || "").trim();
+
+    if (!nextName) return { ok: false, message: "Product name is required" };
+    if (!Number.isFinite(nextPrice) || !Number.isFinite(nextCost) || !Number.isFinite(nextStock) || !Number.isFinite(nextThreshold)) {
+      return { ok: false, message: "Invalid product values" };
+    }
+
+    db.prepare(`
+      UPDATE products
+      SET name=?, sku=?, category=?, price=?, cost=?, stock=?, low_stock_threshold=?, barcode=?, updated_at=datetime('now')
+      WHERE id=? AND store_id=?
+    `).run(nextName, nextSku, nextCategory, nextPrice, nextCost, nextStock, nextThreshold, nextBarcode, product.id, sid);
+
+    Promise.resolve(triggerCatalogSync(sid)).catch(() => {});
+    Promise.resolve(triggerInventorySync(sid)).catch(() => {});
+
+    return {
+      ok: true,
+      message: `${nextName} updated`,
+      summary: `Accepted by ${reviewerName || "store user"}`,
+    };
+  }
+
+  if (entityType === "bank_account_upsert") {
+    const localId = Number(payload.local_account_id || change.entity_local_id || 0);
+    const accountName = String(payload.account_name || "").trim();
+    const bankName = String(payload.bank_name || "").trim();
+    const accountNumber = String(payload.account_number || "").trim();
+    const openingBalance = Number(payload.opening_balance || 0);
+    const note = String(payload.note || "").trim();
+    const active = payload.active === undefined ? 1 : (payload.active ? 1 : 0);
+
+    if (!accountName) return { ok: false, message: "Account name required" };
+    if (!Number.isFinite(openingBalance)) return { ok: false, message: "Invalid opening balance" };
+
+    if (localId) {
+      const existing = db.prepare("SELECT id FROM bank_accounts WHERE id=? AND store_id=?").get(localId, sid);
+      if (existing) {
+        db.prepare(`
+          UPDATE bank_accounts
+          SET account_name=?, bank_name=?, account_number=?, opening_balance=?, note=?, active=?, updated_at=datetime('now')
+          WHERE id=? AND store_id=?
+        `).run(accountName, bankName, accountNumber, openingBalance, note, active, localId, sid);
+      } else {
+        db.prepare(`
+          INSERT INTO bank_accounts (id, store_id, account_name, bank_name, account_number, opening_balance, note, active, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+        `).run(localId, sid, accountName, bankName, accountNumber, openingBalance, note, active);
+      }
+    } else {
+      db.prepare(`
+        INSERT INTO bank_accounts (store_id, account_name, bank_name, account_number, opening_balance, note, active, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+      `).run(sid, accountName, bankName, accountNumber, openingBalance, note, active);
+    }
+
+    Promise.resolve(triggerBankSync(sid)).catch(() => {});
+    return { ok: true, message: `${accountName} saved` };
+  }
+
+  if (entityType === "bank_account_delete") {
+    const localId = Number(payload.local_account_id || change.entity_local_id || 0);
+    if (!localId) return { ok: false, message: "Missing local account id" };
+
+    db.prepare("DELETE FROM bank_transactions WHERE store_id=? AND account_id=?").run(sid, localId);
+    db.prepare("DELETE FROM bank_accounts WHERE store_id=? AND id=?").run(sid, localId);
+    Promise.resolve(triggerBankSync(sid)).catch(() => {});
+    return { ok: true, message: "Bank account deleted" };
+  }
+
+  if (entityType === "bank_transaction_upsert") {
+    const localId = Number(payload.local_transaction_id || change.entity_local_id || 0);
+    const accountId = Number(payload.local_account_id || payload.account_id || 0);
+    const type = String(payload.type || "credit").trim().toLowerCase() === "debit" ? "debit" : "credit";
+    const amount = Number(payload.amount || 0);
+    const reference = String(payload.reference || "").trim();
+    const note = String(payload.note || "").trim();
+    const createdAt = String(payload.created_at || "").trim() || null;
+
+    if (!accountId) return { ok: false, message: "Bank account required" };
+    if (!(amount > 0)) return { ok: false, message: "Amount must be greater than zero" };
+
+    const account = db.prepare("SELECT id FROM bank_accounts WHERE store_id=? AND id=?").get(sid, accountId);
+    if (!account) return { ok: false, message: "Bank account not found in desktop POS" };
+
+    if (localId) {
+      const existing = db.prepare("SELECT id FROM bank_transactions WHERE store_id=? AND id=?").get(sid, localId);
+      if (existing) {
+        db.prepare(`
+          UPDATE bank_transactions
+          SET account_id=?, type=?, amount=?, reference=?, note=?, created_at=COALESCE(?, created_at), updated_at=datetime('now')
+          WHERE id=? AND store_id=?
+        `).run(accountId, type, amount, reference, note, createdAt, localId, sid);
+      } else {
+        db.prepare(`
+          INSERT INTO bank_transactions (id, store_id, account_id, type, amount, reference, note, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), datetime('now'))
+        `).run(localId, sid, accountId, type, amount, reference, note, createdAt);
+      }
+    } else {
+      db.prepare(`
+        INSERT INTO bank_transactions (store_id, account_id, type, amount, reference, note, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), datetime('now'))
+      `).run(sid, accountId, type, amount, reference, note, createdAt);
+    }
+
+    Promise.resolve(triggerBankSync(sid)).catch(() => {});
+    return { ok: true, message: "Bank transaction saved" };
+  }
+
+  if (entityType === "bank_transaction_delete") {
+    const localId = Number(payload.local_transaction_id || change.entity_local_id || 0);
+    if (!localId) return { ok: false, message: "Missing local transaction id" };
+
+    db.prepare("DELETE FROM bank_transactions WHERE store_id=? AND id=?").run(sid, localId);
+    Promise.resolve(triggerBankSync(sid)).catch(() => {});
+    return { ok: true, message: "Bank transaction deleted" };
+  }
+
+  return { ok: false, message: `Unsupported change type: ${entityType}` };
+}
 
   // -------------------- SYNC --------------------
   safeHandle("sync:test", async () => {
@@ -2029,8 +2991,9 @@ function registerIpcHandlers() {
   safeHandle("sync:pushInventory", async () => {
     try {
       const sid = effectiveStoreId();
+      const store = getStoreSettingsForSync(sid);
       const products = db.prepare("SELECT * FROM products WHERE store_id=?").all(sid);
-      await sync.syncInventory(products);
+      await sync.syncInventory({ storeId: sid, storeName: store.store_name, products });
       return true;
     } catch {
       return false;
@@ -2042,12 +3005,25 @@ function registerIpcHandlers() {
 
     try {
       const sid = effectiveStoreId();
+      const store = getStoreSettingsForSync(sid);
       const products = db.prepare("SELECT * FROM products WHERE store_id=?").all(sid);
       const categories = db.prepare("SELECT * FROM categories WHERE store_id=?").all(sid);
-      const ok = await sync.pushSharedCatalog({ storeId: sid, products, categories });
+      const ok = await sync.pushSharedCatalog({ storeId: sid, storeName: store.store_name, products, categories });
       return { ok: !!ok };
     } catch (e) {
       return { ok: false, message: e?.message || "Push failed" };
+    }
+  });
+
+  safeHandle("sync:pushAll", async () => {
+    if (!isAdmin()) return adminOnly();
+
+    try {
+      const sid = effectiveStoreId();
+      await triggerFullSync(sid);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, message: e?.message || "Full push failed" };
     }
   });
 
@@ -2116,6 +3092,79 @@ function registerIpcHandlers() {
       return { ok: true, counts: { products: products.length, categories: categories.length } };
     } catch (e) {
       return { ok: false, message: e?.message || "Pull failed" };
+    }
+  });
+
+
+  safeHandle("sync:pullBank", async () => {
+    try {
+      return await triggerBankPull(effectiveStoreId());
+    } catch (e) {
+      return { ok: false, message: e?.message || "Bank pull failed" };
+    }
+  });
+
+  safeHandle("managerChanges:listPending", async () => {
+    try {
+      if (!currentUser) return [];
+      const sid = effectiveStoreId();
+      return await sync.listPendingManagerChanges({ storeId: sid, status: "pending" });
+    } catch (e) {
+      console.error("[ManagerChanges] listPending failed:", e);
+      return [];
+    }
+  });
+
+  safeHandle("managerChanges:accept", async (_, payload = {}) => {
+    try {
+      if (!currentUser) return { ok: false, message: "Login required" };
+
+      const sid = effectiveStoreId();
+      const changeId = Number(payload.id || 0);
+      if (!changeId) return { ok: false, message: "Missing change id" };
+
+      const pending = await sync.listPendingManagerChanges({ storeId: sid, status: "pending" });
+      const change = pending.find((row) => Number(row.id) === changeId);
+      if (!change) return { ok: false, message: "Pending change not found" };
+
+      const applyResult = applyPendingManagerChange(change, currentUser?.name || currentUser?.username || "");
+      if (!applyResult?.ok) return applyResult;
+
+      await sync.setPendingManagerChangeStatus({
+        id: changeId,
+        storeId: sid,
+        status: "accepted",
+        reviewedBy: currentUser?.username || currentUser?.name || "store-user",
+        reviewNote: String(payload.review_note || applyResult.message || "Accepted in POS").trim(),
+      });
+
+      return { ok: true, message: applyResult.message || "Change accepted" };
+    } catch (e) {
+      console.error("[ManagerChanges] accept failed:", e);
+      return { ok: false, message: e?.message || "Accept failed" };
+    }
+  });
+
+  safeHandle("managerChanges:reject", async (_, payload = {}) => {
+    try {
+      if (!currentUser) return { ok: false, message: "Login required" };
+
+      const sid = effectiveStoreId();
+      const changeId = Number(payload.id || 0);
+      if (!changeId) return { ok: false, message: "Missing change id" };
+
+      await sync.setPendingManagerChangeStatus({
+        id: changeId,
+        storeId: sid,
+        status: "rejected",
+        reviewedBy: currentUser?.username || currentUser?.name || "store-user",
+        reviewNote: String(payload.review_note || "Rejected in POS").trim(),
+      });
+
+      return { ok: true, message: "Change rejected" };
+    } catch (e) {
+      console.error("[ManagerChanges] reject failed:", e);
+      return { ok: false, message: e?.message || "Reject failed" };
     }
   });
 

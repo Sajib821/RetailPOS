@@ -267,20 +267,29 @@ export default function Checkout() {
     return escapeHtml(contact || "").replace(/\n/g, "<br/>");
   };
 
+  const formatFooterHtml = (footer) => {
+    const escaped = escapeHtml(footer || "").replace(/\n/g, "<br/>");
+    return escaped.replace(
+      /(https?:\/\/[^\s<]+)/g,
+      (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`
+    );
+  };
+
   const buildReceiptHtmlA4 = (sale, { autoPrint = false } = {}) => {
     const dt = sale?.date ? new Date(sale.date) : new Date();
     const cust = sale.customer || null;
     const sym = sale.symbol || symbol;
     const contactHtml = formatContactHtml(sale.storeContact || "");
+    const footerHtml = formatFooterHtml(sale.footer || "Thank you for your purchase!");
 
     const itemsHtml = (sale.items || [])
       .map(
         (it) => `
       <tr>
         <td>${escapeHtml(it.product_name)}</td>
-        <td style="text-align:center;">${escapeHtml(String(it.quantity))}</td>
-        <td style="text-align:right;">${escapeHtml(sym)}${Number(it.price).toFixed(2)}</td>
-        <td style="text-align:right;">${escapeHtml(sym)}${Number(it.subtotal).toFixed(2)}</td>
+        <td style="text-align:center; white-space:nowrap;">${escapeHtml(String(it.quantity))}</td>
+        <td style="text-align:right; white-space:nowrap;">${escapeHtml(sym)}${Number(it.price).toFixed(2)}</td>
+        <td style="text-align:right; white-space:nowrap;">${escapeHtml(sym)}${Number(it.subtotal).toFixed(2)}</td>
       </tr>`
       )
       .join("");
@@ -331,72 +340,104 @@ export default function Checkout() {
   <title>Receipt #${escapeHtml(String(sale.id))}</title>
   <style>
     @page { size: A4; margin: 12mm; }
-    html, body { background:#fff; color:#111; font-family: Arial, sans-serif; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background:#fff;
+      color:#111;
+      font-family: "Noto Sans Bengali", "Bangla Sangam MN", "Kohinoor Bangla", "Nirmala UI", "Vrinda", "SolaimanLipi", "Arial Unicode MS", "Segoe UI", Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+    body { min-height: calc(297mm - 24mm); }
+    .page {
+      min-height: calc(297mm - 24mm);
+      display: flex;
+      flex-direction: column;
+    }
+    .content { flex: 1; }
     .brand { font-size: 22px; font-weight: 800; }
     .muted { color:#555; font-size: 12px; margin-top: 4px; line-height: 1.45; }
     .hr { height:1px; background:#eee; margin: 10px 0; }
     table { width:100%; border-collapse: collapse; margin-top: 10px; }
-    th, td { padding: 8px 6px; border-bottom: 1px solid #eee; font-size: 12px; }
+    th, td { padding: 8px 6px; border-bottom: 1px solid #eee; font-size: 12px; vertical-align: top; }
     th { text-align:left; font-size: 12px; color:#333; background:#fafafa; }
-    .right { text-align:right; }
+    .right { text-align:right; white-space:nowrap; }
     .totals { margin-top: 10px; display:flex; justify-content:flex-end; }
     .totals table { width: 340px; }
     .totals td { border-bottom:none; padding: 6px; }
     .grand { font-size: 14px; font-weight: 800; }
-    .footer { margin-top: 14px; font-size: 12px; color: #555; text-align:center; }
     .box { border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px 12px; }
+    td:first-child, th:first-child { width: 46%; }
+    .footer {
+      margin-top: auto;
+      padding-top: 14px;
+      font-size: 12px;
+      color: #555;
+      text-align:center;
+      white-space: normal;
+      word-break: break-word;
+      line-height: 1.5;
+    }
+    .footer a {
+      color: #555;
+      text-decoration: underline;
+      word-break: break-word;
+    }
   </style>
 </head>
 <body>
-  <div>
-    <div style="display:flex; justify-content:space-between; gap:12px;">
-      <div>
-        <div class="brand">${escapeHtml(sale.storeName || "RetailPOS")}</div>
-        ${
-          contactHtml
-            ? `<div class="muted" style="margin-top:6px;">${contactHtml}</div>`
-            : ``
-        }
-        <div class="muted" style="margin-top:8px;">
-          <b>Receipt #:</b> ${escapeHtml(String(sale.id))}<br/>
-          <b>Date:</b> ${escapeHtml(dt.toLocaleString())}<br/>
-          <b>Payment:</b> ${escapeHtml(sale.payment_method || "-")}<br/>
-          ${sale.cashier ? `<b>Cashier:</b> ${escapeHtml(sale.cashier)}<br/>` : ``}
-          <b>Status:</b> ${escapeHtml(sale.status || "completed")}<br/>
-          <b>Returns:</b> customer must bring this receipt #
+  <div class="page">
+    <div class="content">
+      <div style="display:flex; justify-content:space-between; gap:12px;">
+        <div>
+          <div class="brand">${escapeHtml(sale.storeName || "RetailPOS")}</div>
+          ${
+            contactHtml
+              ? `<div class="muted" style="margin-top:6px;">${contactHtml}</div>`
+              : ``
+          }
+          <div class="muted" style="margin-top:8px;">
+            <b>Receipt #:</b> ${escapeHtml(String(sale.id))}<br/>
+            <b>Date:</b> ${escapeHtml(dt.toLocaleString())}<br/>
+            <b>Payment:</b> ${escapeHtml(sale.payment_method || "-")}<br/>
+            ${sale.cashier ? `<b>Cashier:</b> ${escapeHtml(sale.cashier)}<br/>` : ``}
+            <b>Status:</b> ${escapeHtml(sale.status || "completed")}<br/>
+            <b>Returns:</b> customer must bring this receipt #
+          </div>
+          ${paySummaryHtml}
         </div>
-        ${paySummaryHtml}
+        ${customerHtml}
       </div>
-      ${customerHtml}
-    </div>
 
-    <div class="hr"></div>
+      <div class="hr"></div>
 
-    <table>
-      <thead>
-        <tr>
-          <th>Item</th>
-          <th style="text-align:center;">Qty</th>
-          <th class="right">Price</th>
-          <th class="right">Amount</th>
-        </tr>
-      </thead>
-      <tbody>${itemsHtml}</tbody>
-    </table>
-
-    <div class="totals">
       <table>
-        <tr><td class="right">Subtotal</td><td class="right">${escapeHtml(sym)}${Number(sale.subtotal).toFixed(2)}</td></tr>
-        ${
-          Number(sale.discount || 0) > 0
-            ? `<tr><td class="right">Discount</td><td class="right">-${escapeHtml(sym)}${Number(sale.discount).toFixed(2)}</td></tr>`
-            : ``
-        }
-        <tr><td class="right grand">Total</td><td class="right grand">${escapeHtml(sym)}${Number(sale.total).toFixed(2)}</td></tr>
+        <thead>
+          <tr>
+            <th>Item</th>
+            <th style="text-align:center;">Qty</th>
+            <th class="right">Price</th>
+            <th class="right">Amount</th>
+          </tr>
+        </thead>
+        <tbody>${itemsHtml}</tbody>
       </table>
+
+      <div class="totals">
+        <table>
+          <tr><td class="right">Subtotal</td><td class="right">${escapeHtml(sym)}${Number(sale.subtotal).toFixed(2)}</td></tr>
+          ${
+            Number(sale.discount || 0) > 0
+              ? `<tr><td class="right">Discount</td><td class="right">-${escapeHtml(sym)}${Number(sale.discount).toFixed(2)}</td></tr>`
+              : ``
+          }
+          <tr><td class="right grand">Total</td><td class="right grand">${escapeHtml(sym)}${Number(sale.total).toFixed(2)}</td></tr>
+        </table>
+      </div>
     </div>
 
-    <div class="footer">${escapeHtml(sale.footer || "Thank you for your purchase!")}</div>
+    <div class="footer">${footerHtml}</div>
   </div>
   ${autoPrint ? `<script>window.onload=()=>{window.focus();window.print();};</script>` : ``}
 </body>

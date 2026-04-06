@@ -1,6 +1,91 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { usePOS } from "../App";
 
+
+function ConfirmDialog({
+  open,
+  title = "Confirm delete",
+  message = "Are you sure?",
+  confirmText = "Delete",
+  cancelText = "Cancel",
+  busy = false,
+  onConfirm,
+  onCancel,
+}) {
+  if (!open) return null;
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.62)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 10000,
+        padding: 16,
+      }}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !busy) onCancel?.();
+      }}
+    >
+      <div
+        style={{
+          width: 460,
+          maxWidth: "100%",
+          background: "var(--surface)",
+          border: "1px solid var(--border)",
+          borderRadius: 18,
+          boxShadow: "var(--shadow)",
+          padding: 18,
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div style={{ fontSize: 18, fontWeight: 900, color: "var(--text)" }}>{title}</div>
+        <div style={{ marginTop: 10, color: "var(--text2)", lineHeight: 1.55, whiteSpace: "pre-line" }}>
+          {message}
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 18 }}>
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid var(--border)",
+              background: "rgba(255,255,255,0.03)",
+              color: "var(--text)",
+              fontWeight: 800,
+              cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.7 : 1,
+            }}
+          >
+            {cancelText}
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={busy}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(244,63,94,0.35)",
+              background: "rgba(244,63,94,0.12)",
+              color: "#fecdd3",
+              fontWeight: 900,
+              cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.7 : 1,
+            }}
+          >
+            {busy ? "Deleting..." : confirmText}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 export default function Users() {
   const { api, showToast, me, setMe } = usePOS();
 
@@ -19,6 +104,8 @@ export default function Users() {
   // USERS list
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [confirmState, setConfirmState] = useState(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
 
   // create user form (admin/superadmin)
   const [form, setForm] = useState({
@@ -334,7 +421,25 @@ export default function Users() {
     showToast("PIN updated ✅");
   }
 
-  async function deleteUser(u) {
+  async function performDeleteUser(u) {
+    setConfirmBusy(true);
+    try {
+      const payload = isSuper
+        ? { id: u.id, store_id: (activeManageStoreId || store.store_id || "").trim() }
+        : u.id;
+
+      const res = await api.users.delete(payload);
+      if (res?.ok === false) return showToast(res.message || "Delete failed", "error");
+
+      showToast("User deleted", "warning");
+      await refresh();
+      setConfirmState(null);
+    } finally {
+      setConfirmBusy(false);
+    }
+  }
+
+  function deleteUser(u) {
     if (!isAdmin) return showToast("Admin only", "error");
     if (!isSuper && me?.id === u.id) return showToast("You can’t delete the logged-in user", "warning");
 
@@ -342,18 +447,12 @@ export default function Users() {
     const activeAdmins = rows.filter((x) => x.role === "admin" && x.active).length;
     if (u.role === "admin" && activeAdmins <= 1) return showToast("You can’t delete the last admin", "warning");
 
-    if (!confirm(`Delete user "${u.username}" (${u.name})?`)) return;
-
-    // main.js accepts number OR {id,store_id} — we use store_id for superadmin
-    const payload = isSuper
-      ? { id: u.id, store_id: (activeManageStoreId || store.store_id || "").trim() }
-      : u.id;
-
-    const res = await api.users.delete(payload);
-    if (res?.ok === false) return showToast(res.message || "Delete failed", "error");
-
-    showToast("User deleted", "warning");
-    await refresh();
+    setConfirmState({
+      title: "Delete user",
+      message: `Delete user "${u.username}" (${u.name})?`,
+      confirmText: "Delete user",
+      onConfirm: () => performDeleteUser(u),
+    });
   }
 
   return (
@@ -643,6 +742,19 @@ export default function Users() {
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={!!confirmState}
+        title={confirmState?.title}
+        message={confirmState?.message}
+        confirmText={confirmState?.confirmText}
+        busy={confirmBusy}
+        onCancel={() => {
+          if (confirmBusy) return;
+          setConfirmState(null);
+        }}
+        onConfirm={() => confirmState?.onConfirm?.()}
+      />
     </div>
   );
 }

@@ -1,6 +1,91 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { usePOS } from "../App";
 
+
+function ConfirmDialog({
+  open,
+  title = "Confirm delete",
+  message = "Are you sure?",
+  confirmText = "Delete",
+  cancelText = "Cancel",
+  busy = false,
+  onConfirm,
+  onCancel,
+}) {
+  if (!open) return null;
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.62)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 10000,
+        padding: 16,
+      }}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !busy) onCancel?.();
+      }}
+    >
+      <div
+        style={{
+          width: 460,
+          maxWidth: "100%",
+          background: "var(--surface)",
+          border: "1px solid var(--border)",
+          borderRadius: 18,
+          boxShadow: "var(--shadow)",
+          padding: 18,
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div style={{ fontSize: 18, fontWeight: 900, color: "var(--text)" }}>{title}</div>
+        <div style={{ marginTop: 10, color: "var(--text2)", lineHeight: 1.55, whiteSpace: "pre-line" }}>
+          {message}
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 18 }}>
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid var(--border)",
+              background: "rgba(255,255,255,0.03)",
+              color: "var(--text)",
+              fontWeight: 800,
+              cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.7 : 1,
+            }}
+          >
+            {cancelText}
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={busy}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(244,63,94,0.35)",
+              background: "rgba(244,63,94,0.12)",
+              color: "#fecdd3",
+              fontWeight: 900,
+              cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.7 : 1,
+            }}
+          >
+            {busy ? "Deleting..." : confirmText}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 function Customers() {
   const { api, showToast } = usePOS();
 
@@ -9,6 +94,8 @@ function Customers() {
   const [form, setForm] = useState({ name: "", phone: "", email: "", address: "" });
   const [editingId, setEditingId] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [confirmState, setConfirmState] = useState(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
 
   const styles = {
     page: { padding: 20, height: "100%", overflow: "auto" },
@@ -149,15 +236,31 @@ function Customers() {
     setForm({ name: c.name || "", phone: c.phone || "", email: c.email || "", address: c.address || "" });
   }
 
-  async function del(id) {
-    if (!confirm("Delete customer?")) return;
+  async function performDeleteCustomer(id) {
+    setConfirmBusy(true);
     try {
       await api.customers.delete(id);
       showToast("Customer deleted", "warning");
-      load();
+      await load();
+      if (Number(editingId) === Number(id)) {
+        setForm({ name: "", phone: "", email: "", address: "" });
+        setEditingId(null);
+      }
+      setConfirmState(null);
     } catch {
       showToast("Delete failed", "error");
+    } finally {
+      setConfirmBusy(false);
     }
+  }
+
+  function del(id) {
+    setConfirmState({
+      title: "Delete customer",
+      message: "Delete this customer?",
+      confirmText: "Delete customer",
+      onConfirm: () => performDeleteCustomer(id),
+    });
   }
 
   return (
@@ -299,6 +402,19 @@ function Customers() {
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={!!confirmState}
+        title={confirmState?.title}
+        message={confirmState?.message}
+        confirmText={confirmState?.confirmText}
+        busy={confirmBusy}
+        onCancel={() => {
+          if (confirmBusy) return;
+          setConfirmState(null);
+        }}
+        onConfirm={() => confirmState?.onConfirm?.()}
+      />
     </div>
   );
 }

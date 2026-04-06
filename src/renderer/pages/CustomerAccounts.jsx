@@ -11,7 +11,7 @@ export default function CustomerAccounts() {
   const fmt = (n) => `${sym}${(Number(n) || 0).toFixed(2)}`;
   const isAdminOrSuper = me?.role === "admin" || me?.role === "superadmin";
 
-  const [settings, setSettings] = useState({ contact: "", store_name: "" });
+  const [settings, setSettings] = useState({ contact: "", store_name: "", receipt_footer: "" });
 
   const [customers, setCustomers] = useState([]);
   const [q, setQ] = useState("");
@@ -25,8 +25,9 @@ export default function CustomerAccounts() {
   const [fy, setFy] = useState("");
   const [history, setHistory] = useState({ sales: [], payments: [] });
 
-  const [customYears, setCustomYears] = useState([]);
-  const [newFYStartYear, setNewFYStartYear] = useState(String(new Date().getFullYear()));
+  const [fyRows, setFyRows] = useState([]);
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
 
   const [payAmount, setPayAmount] = useState("");
   const [payMethod, setPayMethod] = useState("cash");
@@ -52,19 +53,30 @@ export default function CustomerAccounts() {
 
   const canImportHistorical = me?.role === "admin" || me?.role === "superadmin";
 
-  const baseFiscalYears = useMemo(() => {
-    const now = new Date();
-    const cur = now.getFullYear();
-    const list = [];
-    for (let y = cur - 5; y <= cur + 2; y += 1) list.push(`${y}-${y + 1}`);
-    return list.reverse();
-  }, []);
+  const fiscalYears = useMemo(() => fyRows.map((r) => r.label), [fyRows]);
 
-  const fiscalYears = useMemo(() => {
-    return Array.from(new Set([...customYears, ...baseFiscalYears])).sort((a, b) =>
-      a > b ? -1 : 1
-    );
-  }, [baseFiscalYears, customYears]);
+  const fyMetaByLabel = useMemo(() => {
+    const map = {};
+    fyRows.forEach((row) => {
+      map[row.label] = row;
+    });
+    return map;
+  }, [fyRows]);
+
+  function formatFyDate(value) {
+    if (!value) return "";
+    const d = new Date(`${String(value).slice(0, 10)}T00:00:00`);
+    if (Number.isNaN(d.getTime())) return String(value || "");
+    return d.toLocaleDateString("en-GB");
+  }
+
+  function getFYOptionLabel(label) {
+    const row = fyMetaByLabel[label];
+    if (row?.start_date && row?.end_date) {
+      return `${label} • ${formatFyDate(row.start_date)} - ${formatFyDate(row.end_date)}`;
+    }
+    return label;
+  }
 
   const selectedYearRow = due?.years?.find((y) => y.fiscal_year === fy) || null;
 
@@ -84,19 +96,12 @@ export default function CustomerAccounts() {
     [paymentRows]
   );
 
-  const completedSalesPaidTotal = useMemo(
-    () =>
-      salesRows
-        .filter(
-          (s) =>
-            (s.sale_type || "sale") !== "refund" &&
-            String(s.status || "").toLowerCase() === "completed"
-        )
-        .reduce((a, s) => a + Number(s.total || 0), 0),
+  const salesPaidTotal = useMemo(
+    () => salesRows.reduce((a, s) => a + getPaidNumberFromSale(s), 0),
     [salesRows]
   );
 
-  const totalPaidInView = manualPaymentsTotal + completedSalesPaidTotal;
+  const totalPaidInView = manualPaymentsTotal + salesPaidTotal;
 
   async function loadSettings() {
     try {
@@ -104,9 +109,21 @@ export default function CustomerAccounts() {
       setSettings({
         contact: s?.contact || "",
         store_name: s?.store_name || "",
+        receipt_footer: s?.receipt_footer || "Thank you for shopping with us!",
       });
     } catch {
-      setSettings({ contact: "", store_name: "" });
+      setSettings({ contact: "", store_name: "", receipt_footer: "Thank you for shopping with us!" });
+    }
+  }
+
+  async function loadFiscalYears() {
+    try {
+      const rows = await api.fiscalYears?.list?.();
+      setFyRows(Array.isArray(rows) ? rows : []);
+    } catch (e) {
+      console.error(e);
+      setFyRows([]);
+      showToast("Failed to load financial years", "error");
     }
   }
 
@@ -135,6 +152,8 @@ export default function CustomerAccounts() {
         customer_id,
         range: actualRange,
         fiscal_year,
+        from_date: fromDate,
+        to_date: toDate,
       });
 
       if (!res?.ok) {
@@ -168,9 +187,9 @@ export default function CustomerAccounts() {
       setDue(d);
 
       const resolvedFY =
-        preferredFY !== undefined && preferredFY !== null
+        preferredFY !== undefined && preferredFY !== null && String(preferredFY).trim() !== ""
           ? preferredFY
-          : d.years?.[0]?.fiscal_year || "";
+          : d.years?.[0]?.fiscal_year || fiscalYears[0] || "";
 
       setFy(resolvedFY);
       setPayFY((prev) => prev || d.years?.[0]?.fiscal_year || fiscalYears[0] || "");
@@ -191,6 +210,7 @@ export default function CustomerAccounts() {
   useEffect(() => {
     loadCustomers();
     loadSettings();
+    loadFiscalYears();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storeSafe.store_id]);
 
@@ -205,7 +225,7 @@ export default function CustomerAccounts() {
   async function handleChangeFY(nextFY) {
     setFy(nextFY);
     if (!selected) return;
-    const nextRange = nextFY ? "fy" : "all";
+    const nextRange = nextFY ? (range === "all" ? "fy" : range) : (range === "fy" ? "all" : range);
     setRange(nextRange);
     await loadHistory(selected.id, nextRange, nextFY);
   }
@@ -214,21 +234,6 @@ export default function CustomerAccounts() {
     setRange(nextRange);
     if (!selected) return;
     await loadHistory(selected.id, nextRange, fy);
-  }
-
-  function createFinancialYear() {
-    const y = Number(newFYStartYear || 0);
-    if (!y || y < 2000 || y > 3000) {
-      showToast("Enter a valid start year", "warning");
-      return;
-    }
-
-    const fyValue = `${y}-${y + 1}`;
-    setCustomYears((prev) => Array.from(new Set([fyValue, ...prev])));
-    setFy(fyValue);
-    setPayFY((prev) => prev || fyValue);
-    setHistFY(fyValue);
-    showToast(`Financial year ${fyValue} created ✅`);
   }
 
   async function addPayment() {
@@ -356,12 +361,62 @@ export default function CustomerAccounts() {
     return settings.contact || "";
   }
 
+  function getFooterText() {
+    return settings.receipt_footer || "Thank you for shopping with us!";
+  }
+
+  function formatFooterHtml(text) {
+    return escapeHtml(text || "").replace(/\n/g, "<br>");
+  }
+
+  function getStatementScopeLabel() {
+    if (range === "custom" && fromDate && toDate) return `${fromDate} to ${toDate}`;
+    if (range === "today") return "Today";
+    if (range === "7d") return "Last 7 days";
+    if (range === "month") return "Last 30 days";
+    if (range === "fy" && fy) {
+      const row = fyMetaByLabel[fy];
+      if (row?.start_date && row?.end_date) {
+        return `${fy} (${formatFyDate(row.start_date)} - ${formatFyDate(row.end_date)})`;
+      }
+      return fy;
+    }
+    return fy ? getFYOptionLabel(fy) : "All years up to today";
+  }
+
+  function parseSalePaymentJson(sale) {
+    try {
+      const raw = sale?.payment_json;
+      if (!raw) return {};
+      if (typeof raw === "string") return JSON.parse(raw);
+      if (typeof raw === "object" && raw !== null) return raw;
+      return {};
+    } catch {
+      return {};
+    }
+  }
+
+  function getPaidNumberFromSale(sale) {
+    const isRefund = (sale?.sale_type || "sale") === "refund";
+    if (isRefund) return 0;
+
+    const total = Number(sale?.total || 0);
+    const payment = parseSalePaymentJson(sale);
+    const paidFromJson = Number(payment?.paidTotal);
+
+    if (Number.isFinite(paidFromJson) && paidFromJson > 0) {
+      return Math.min(total, Math.max(0, paidFromJson));
+    }
+
+    const isCompleted = String(sale?.status || "").toLowerCase() === "completed";
+    if (isCompleted) return total;
+
+    return 0;
+  }
+
   function getPaidValueFromSale(sale) {
-    const isRefund = (sale.sale_type || "sale") === "refund";
-    const isCompleted = String(sale.status || "").toLowerCase() === "completed";
-    if (isRefund) return "";
-    if (isCompleted) return Number(sale.total || 0);
-    return "";
+    const paid = getPaidNumberFromSale(sale);
+    return paid > 0 ? paid : "";
   }
 
   function getSalePaymentLabel(sale) {
@@ -376,7 +431,7 @@ export default function CustomerAccounts() {
     const salesWithItems = await fetchSalesWithItemsForStatement();
     const payments = Array.isArray(history?.payments) ? history.payments : [];
 
-    const statementLabel = fy ? fy : "All years up to today";
+    const statementLabel = getStatementScopeLabel();
     const yearDue = fy ? Number(selectedYearRow?.due || 0) : Number(due?.overall_due || 0);
 
     const totalPurchased = salesWithItems
@@ -385,13 +440,7 @@ export default function CustomerAccounts() {
 
     const totalPaid =
       payments.reduce((a, p) => a + Number(p.amount || 0), 0) +
-      salesWithItems
-        .filter(
-          (s) =>
-            (s.sale_type || "sale") !== "refund" &&
-            String(s.status || "").toLowerCase() === "completed"
-        )
-        .reduce((a, s) => a + Number(s.total || 0), 0);
+      salesWithItems.reduce((a, s) => a + getPaidNumberFromSale(s), 0);
 
     const statementRows = [];
 
@@ -424,6 +473,7 @@ export default function CustomerAccounts() {
     statementRows.sort((a, b) => a.sortTs - b.sortTs);
 
     const contactHtml = escapeHtml(getContactText()).replace(/\n/g, "<br>");
+    const footerHtml = formatFooterHtml(getFooterText());
 
     return `
       <html>
@@ -435,12 +485,23 @@ export default function CustomerAccounts() {
             size: A4;
             margin: 16mm 12mm 16mm 12mm;
           }
-          body {
-            font-family: Arial, Helvetica, sans-serif;
-            color: #111827;
-            font-size: 11px;
+          html, body {
             margin: 0;
             padding: 0;
+          }
+          body {
+            font-family: "Noto Sans Bengali", "Hind Siliguri", "SolaimanLipi", Arial, Helvetica, sans-serif;
+            color: #111827;
+            font-size: 11px;
+            min-height: calc(297mm - 32mm);
+          }
+          .page {
+            min-height: calc(297mm - 32mm);
+            display: flex;
+            flex-direction: column;
+          }
+          .content {
+            flex: 1;
           }
           .header {
             border-bottom: 2px solid #111827;
@@ -539,99 +600,107 @@ export default function CustomerAccounts() {
             border-bottom: none;
           }
           .footer {
-            margin-top: 10px;
+            margin-top: auto;
+            padding-top: 12px;
             color: #6b7280;
             font-size: 10px;
+            line-height: 1.5;
+            text-align: center;
+            word-break: break-word;
           }
         </style>
       </head>
       <body>
-        <div class="header">
-          <div>
-            <div class="title">Customer Statement</div>
-            <div class="muted">${escapeHtml(getBranchLabel())}</div>
-            <div class="muted">Currency: ${escapeHtml(storeSafe.currency)}</div>
-            <div class="muted">Statement period: ${escapeHtml(statementLabel)}</div>
-            ${contactHtml ? `<div class="muted" style="margin-top:4px;">${contactHtml}</div>` : ""}
-          </div>
-          <div style="text-align:right;">
-            <div class="muted"><b>Generated:</b> ${escapeHtml(new Date().toLocaleString())}</div>
-          </div>
-        </div>
+        <div class="page">
+          <div class="content">
+            <div class="header">
+              <div>
+                <div class="title">Customer Statement</div>
+                <div class="muted">${escapeHtml(getBranchLabel())}</div>
+                <div class="muted">Currency: ${escapeHtml(storeSafe.currency)}</div>
+                <div class="muted">Statement period: ${escapeHtml(statementLabel)}</div>
+                ${contactHtml ? `<div class="muted" style="margin-top:4px;">${contactHtml}</div>` : ""}
+              </div>
+              <div style="text-align:right;">
+                <div class="muted"><b>Generated:</b> ${escapeHtml(new Date().toLocaleString())}</div>
+              </div>
+            </div>
 
-        <div class="customer-section">
-          <div class="customer-name">${escapeHtml(customer?.name || "")}</div>
-          <div class="muted">
-            ${escapeHtml(customer?.phone || "")}${customer?.email ? ` · ${escapeHtml(customer.email)}` : ""}
-          </div>
-          <div class="muted">${escapeHtml(customer?.address || "")}</div>
-        </div>
+            <div class="customer-section">
+              <div class="customer-name">${escapeHtml(customer?.name || "")}</div>
+              <div class="muted">
+                ${escapeHtml(customer?.phone || "")}${customer?.email ? ` · ${escapeHtml(customer.email)}` : ""}
+              </div>
+              <div class="muted">${escapeHtml(customer?.address || "")}</div>
+            </div>
 
-        <div class="statement-table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th class="col-date">Date</th>
-                <th class="col-ref">Ref</th>
-                <th class="col-particulars">Particulars</th>
-                <th class="col-debit right">Purchase</th>
-                <th class="col-credit right">Paid</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${
-                statementRows.length
-                  ? statementRows
-                      .map(
-                        (row) => `
+            <div class="statement-table-wrap">
+              <table>
+                <thead>
                   <tr>
-                    <td>${escapeHtml(row.date)}</td>
-                    <td>${escapeHtml(row.ref)}</td>
-                    <td>
-                      ${escapeHtml(row.particulars)}
-                      ${row.note ? `<div class="subnote">${escapeHtml(row.note)}</div>` : ""}
-                    </td>
-                    <td class="right debit">${row.debit === "" ? "" : fmt(row.debit)}</td>
-                    <td class="right credit">${row.credit === "" ? "" : fmt(row.credit)}</td>
+                    <th class="col-date">Date</th>
+                    <th class="col-ref">Ref</th>
+                    <th class="col-particulars">Particulars</th>
+                    <th class="col-debit right">Purchase</th>
+                    <th class="col-credit right">Paid</th>
                   </tr>
-                `
-                      )
-                      .join("")
-                  : `
-                  <tr>
-                    <td colspan="5" style="text-align:center;padding:18px;color:#6b7280;">
-                      No statement data found
-                    </td>
-                  </tr>
-                `
-              }
-            </tbody>
-          </table>
-        </div>
+                </thead>
+                <tbody>
+                  ${
+                    statementRows.length
+                      ? statementRows
+                          .map(
+                            (row) => `
+                      <tr>
+                        <td>${escapeHtml(row.date)}</td>
+                        <td>${escapeHtml(row.ref)}</td>
+                        <td>
+                          ${escapeHtml(row.particulars)}
+                          ${row.note ? `<div class="subnote">${escapeHtml(row.note)}</div>` : ""}
+                        </td>
+                        <td class="right debit">${row.debit === "" ? "" : fmt(row.debit)}</td>
+                        <td class="right credit">${row.credit === "" ? "" : fmt(row.credit)}</td>
+                      </tr>
+                    `
+                          )
+                          .join("")
+                      : `
+                      <tr>
+                        <td colspan="5" style="text-align:center;padding:18px;color:#6b7280;">
+                          No statement data found
+                        </td>
+                      </tr>
+                    `
+                  }
+                </tbody>
+              </table>
+            </div>
 
-        <div class="summary-wrap">
-          <div class="summary-box">
-            <div class="summary-title">Summary</div>
-            <div class="sum-row">
-              <div><b>Selected financial year due</b></div>
-              <div><b>${fmt(yearDue)}</b></div>
-            </div>
-            <div class="sum-row">
-              <div>Total purchased amount</div>
-              <div>${fmt(totalPurchased)}</div>
-            </div>
-            <div class="sum-row">
-              <div>Total paid</div>
-              <div>${fmt(totalPaid)}</div>
-            </div>
-            <div class="sum-row">
-              <div><b>Total due (all years)</b></div>
-              <div><b>${fmt(due?.overall_due || 0)}</b></div>
+            <div class="summary-wrap">
+              <div class="summary-box">
+                <div class="summary-title">Summary</div>
+                <div class="sum-row">
+                  <div><b>${fy ? "Selected financial year due" : "Due in this statement"}</b></div>
+                  <div><b>${fmt(yearDue)}</b></div>
+                </div>
+                <div class="sum-row">
+                  <div>Total purchased amount</div>
+                  <div>${fmt(totalPurchased)}</div>
+                </div>
+                <div class="sum-row">
+                  <div>Total paid</div>
+                  <div>${fmt(totalPaid)}</div>
+                </div>
+                <div class="sum-row">
+                  <div><b>Total due (all years)</b></div>
+                  <div><b>${fmt(due?.overall_due || 0)}</b></div>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
 
-        <div class="footer">Generated by RetailPOS</div>
+          <div class="footer">${footerHtml}</div>
+        </div>
       </body>
       </html>
     `;
@@ -643,8 +712,8 @@ export default function CustomerAccounts() {
 
     const html = await buildStatementHtml();
     const safeName = String(selected.name || "customer").replace(/[^\w\-]+/g, "_");
-    const fyLabel = fy ? fy : "all_years";
-    const fileName = `statement-${safeName}-${fyLabel}.pdf`;
+    const scopeLabel = getStatementScopeLabel().replace(/[^\w\-]+/g, "_");
+    const fileName = `statement-${safeName}-${scopeLabel}.pdf`;
 
     const r = await api.receipt.savePdf({ html, fileName });
     if (!r?.ok) return showToast(r?.message || "Save failed", "error");
@@ -658,14 +727,14 @@ export default function CustomerAccounts() {
 
     const html = await buildStatementHtml();
     const safeName = String(selected.name || "customer").replace(/[^\w\-]+/g, "_");
-    const fyLabel = fy ? fy : "all_years";
+    const scopeLabel = getStatementScopeLabel();
 
     setEmailModal({
       open: true,
       to: defaultEmail || selected?.email || "",
-      subject: `Customer statement - ${selected.name} - ${fy ? fy : "All years"}`,
+      subject: `Customer statement - ${selected.name} - ${scopeLabel}`,
       html,
-      fileName: `statement-${safeName}-${fyLabel}.pdf`,
+      fileName: `statement-${safeName}-${scopeLabel.replace(/[^\w\-]+/g, "_")}.pdf`,
       sending: false,
     });
   }
@@ -902,9 +971,9 @@ export default function CustomerAccounts() {
                         style={softSelect()}
                       >
                         <option value="">All years up to today</option>
-                        {fiscalYears.map((y) => (
-                          <option key={y} value={y}>
-                            {y}
+                        {fyRows.map((row) => (
+                          <option key={`${row.label}-${row.start_date || ""}`} value={row.label}>
+                            {getFYOptionLabel(row.label)}
                           </option>
                         ))}
                       </select>
@@ -921,33 +990,41 @@ export default function CustomerAccounts() {
                         <option value="7d">Last 7 days</option>
                         <option value="month">Last 30 days</option>
                         <option value="fy">Selected financial year</option>
+                        <option value="custom">Custom date range</option>
                         <option value="all">All time</option>
                       </select>
                     </div>
                   </div>
 
-                  <div
-                    style={{
-                      marginTop: 12,
-                      display: "grid",
-                      gridTemplateColumns: "220px 160px 160px",
-                      gap: 10,
-                      alignItems: "end",
-                    }}
-                  >
-                    <div>
-                      <div style={label()}>Create financial year</div>
-                      <input
-                        value={newFYStartYear}
-                        onChange={(e) => setNewFYStartYear(e.target.value)}
-                        style={input()}
-                        placeholder="2027"
-                      />
+                  {range === "custom" && (
+                    <div
+                      style={{
+                        marginTop: 12,
+                        display: "grid",
+                        gridTemplateColumns: "1fr 1fr",
+                        gap: 10,
+                      }}
+                    >
+                      <div>
+                        <div style={label()}>From date</div>
+                        <input
+                          type="date"
+                          value={fromDate}
+                          onChange={(e) => setFromDate(e.target.value)}
+                          style={input()}
+                        />
+                      </div>
+                      <div>
+                        <div style={label()}>To date</div>
+                        <input
+                          type="date"
+                          value={toDate}
+                          onChange={(e) => setToDate(e.target.value)}
+                          style={input()}
+                        />
+                      </div>
                     </div>
-                    <button style={btnGhost()} onClick={createFinancialYear}>
-                      Create financial year
-                    </button>
-                  </div>
+                  )}
 
                   <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
                     <button style={btnPrimary()} onClick={savePdf}>
@@ -1079,9 +1156,9 @@ export default function CustomerAccounts() {
                           onChange={(e) => setPayFY(e.target.value)}
                           style={softSelect()}
                         >
-                          {fiscalYears.map((y) => (
-                            <option key={y} value={y}>
-                              {y}
+                          {fyRows.map((row) => (
+                            <option key={`${row.label}-${row.start_date || ""}`} value={row.label}>
+                              {getFYOptionLabel(row.label)}
                             </option>
                           ))}
                         </select>
@@ -1174,9 +1251,9 @@ export default function CustomerAccounts() {
                           onChange={(e) => setHistFY(e.target.value)}
                           style={softSelect()}
                         >
-                          {fiscalYears.map((y) => (
-                            <option key={y} value={y}>
-                              {y}
+                          {fyRows.map((row) => (
+                            <option key={`${row.label}-${row.start_date || ""}`} value={row.label}>
+                              {getFYOptionLabel(row.label)}
                             </option>
                           ))}
                         </select>

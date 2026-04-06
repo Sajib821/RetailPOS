@@ -1,6 +1,89 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { usePOS } from "../App";
 
+function ConfirmDialog({
+  open,
+  title = "Confirm delete",
+  message = "Are you sure?",
+  confirmText = "Delete",
+  cancelText = "Cancel",
+  busy = false,
+  onConfirm,
+  onCancel,
+}) {
+  if (!open) return null;
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.62)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 10000,
+        padding: 16,
+      }}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !busy) onCancel?.();
+      }}
+    >
+      <div
+        style={{
+          width: 460,
+          maxWidth: "100%",
+          background: "var(--surface)",
+          border: "1px solid var(--border)",
+          borderRadius: 18,
+          boxShadow: "var(--shadow)",
+          padding: 18,
+        }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div style={{ fontSize: 18, fontWeight: 900, color: "var(--text)" }}>{title}</div>
+        <div style={{ marginTop: 10, color: "var(--text2)", lineHeight: 1.55, whiteSpace: "pre-line" }}>
+          {message}
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 18 }}>
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid var(--border)",
+              background: "rgba(255,255,255,0.03)",
+              color: "var(--text)",
+              fontWeight: 800,
+              cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.7 : 1,
+            }}
+          >
+            {cancelText}
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={busy}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 12,
+              border: "1px solid rgba(244,63,94,0.35)",
+              background: "rgba(244,63,94,0.12)",
+              color: "#fecdd3",
+              fontWeight: 900,
+              cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.7 : 1,
+            }}
+          >
+            {busy ? "Deleting..." : confirmText}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const symMap = { BDT: "৳", USD: "$", GBP: "£", EUR: "€" };
 
 export default function Products() {
@@ -16,7 +99,6 @@ export default function Products() {
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
 
-  // create form
   const [form, setForm] = useState({
     name: "",
     sku: "",
@@ -28,9 +110,16 @@ export default function Products() {
     low_stock_threshold: "5",
   });
 
-  // edit modal
+  const [newCat, setNewCat] = useState({ name: "", color: "#6366f1" });
+
   const [editOpen, setEditOpen] = useState(false);
   const [edit, setEdit] = useState(null);
+
+  const [catEditOpen, setCatEditOpen] = useState(false);
+  const [catEdit, setCatEdit] = useState(null);
+
+  const [confirmState, setConfirmState] = useState(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -60,12 +149,10 @@ export default function Products() {
   }, [q]); // eslint-disable-line
 
   const canCreate = useMemo(() => {
-    return (
-      form.name.trim() &&
-      String(form.price).trim() !== "" &&
-      String(form.category).trim() !== ""
-    );
+    return form.name.trim() && String(form.price).trim() !== "" && String(form.category).trim() !== "";
   }, [form]);
+
+  const canAddCat = useMemo(() => newCat.name.trim().length > 0, [newCat.name]);
 
   const resetForm = () =>
     setForm({
@@ -100,7 +187,28 @@ export default function Products() {
 
       showToast("Product created ✅");
       resetForm();
-      load();
+      await load();
+    } catch (e) {
+      console.error(e);
+      showToast("Create failed", "error");
+    }
+  }
+
+  async function addCategory() {
+    if (!isAdmin) return showToast("Admin only", "error");
+    if (!canAddCat) return showToast("Category name required", "warning");
+
+    try {
+      const res = await api.categories.create({
+        name: newCat.name.trim(),
+        color: newCat.color,
+      });
+
+      if (res?.ok === false) return showToast(res.message || "Create failed", "error");
+
+      showToast("Category created ✅");
+      setNewCat({ name: "", color: "#6366f1" });
+      await load();
     } catch (e) {
       console.error(e);
       showToast("Create failed", "error");
@@ -146,26 +254,97 @@ export default function Products() {
       showToast("Product updated ✅");
       setEditOpen(false);
       setEdit(null);
-      load();
+      await load();
     } catch (e) {
       console.error(e);
       showToast("Update failed", "error");
     }
   }
 
-  async function del(p) {
-    if (!isAdmin) return showToast("Admin only", "error");
-    if (!confirm(`Delete "${p.name}"?`)) return;
+  function openCategoryEdit(c) {
+    setCatEdit({
+      id: c.id,
+      name: c.name || "",
+      color: c.color || "#6366f1",
+    });
+    setCatEditOpen(true);
+  }
 
+  async function saveCategoryEdit() {
+    if (!isAdmin) return showToast("Admin only", "error");
+    if (!catEdit?.name?.trim()) return showToast("Name required", "warning");
+
+    try {
+      const res = await api.categories.update({
+        id: catEdit.id,
+        name: catEdit.name.trim(),
+        color: catEdit.color || "#6366f1",
+      });
+
+      if (res?.ok === false) return showToast(res.message || "Update failed", "error");
+
+      showToast("Category updated ✅");
+      setCatEditOpen(false);
+      setCatEdit(null);
+      await load();
+    } catch (e) {
+      console.error(e);
+      showToast("Update failed", "error");
+    }
+  }
+
+  async function performDeleteProduct(p) {
+    setConfirmBusy(true);
     try {
       const res = await api.products.delete(p.id);
       if (res?.ok === false) return showToast(res.message || "Delete failed", "error");
       showToast("Deleted", "warning");
-      load();
+      await load();
+      setConfirmState(null);
     } catch (e) {
       console.error(e);
       showToast("Delete failed", "error");
+    } finally {
+      setConfirmBusy(false);
     }
+  }
+
+  async function performDeleteCategory(c) {
+    setConfirmBusy(true);
+    try {
+      const res = await api.categories.delete(c.id);
+      if (res?.ok === false) return showToast(res.message || "Delete failed", "error");
+      showToast("Category deleted", "warning");
+      await load();
+      if (form.category === c.name) setForm((prev) => ({ ...prev, category: "" }));
+      if (edit?.category === c.name) setEdit((prev) => (prev ? { ...prev, category: "" } : prev));
+      setConfirmState(null);
+    } catch (e) {
+      console.error(e);
+      showToast("Delete failed", "error");
+    } finally {
+      setConfirmBusy(false);
+    }
+  }
+
+  function del(p) {
+    if (!isAdmin) return showToast("Admin only", "error");
+    setConfirmState({
+      title: "Delete product",
+      message: `Delete "${p.name}"?`,
+      confirmText: "Delete product",
+      onConfirm: () => performDeleteProduct(p),
+    });
+  }
+
+  function deleteCategory(c) {
+    if (!isAdmin) return showToast("Admin only", "error");
+    setConfirmState({
+      title: "Delete category",
+      message: `Delete category "${c.name}"?\n\nProducts using this category will be cleared.`,
+      confirmText: "Delete category",
+      onConfirm: () => performDeleteCategory(c),
+    });
   }
 
   return (
@@ -175,13 +354,16 @@ export default function Products() {
           <div>
             <h1 style={S.title}>Products</h1>
             <div style={S.subtitle}>
-              {isAdmin ? "Admin can edit selling price + buying price." : "Read-only (admin only to edit)."}
+              {isAdmin
+                ? "Admin can manage products, prices, and product categories here."
+                : "Read-only (admin only to edit)."}
             </div>
           </div>
 
-          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <div style={S.pill}>{currency} ({sym})</div>
             <div style={S.pill}>{loading ? "Loading…" : `${products.length} products`}</div>
+            <div style={S.pill}>{`${categories.length} categories`}</div>
           </div>
         </div>
 
@@ -195,12 +377,9 @@ export default function Products() {
               style={S.search}
             />
           </div>
-          <div style={S.pill}>
-            {me ? `👤 ${me.name} (${me.role})` : "Not logged in"}
-          </div>
+          <div style={S.pill}>{me ? `👤 ${me.name} (${me.role})` : "Not logged in"}</div>
         </div>
 
-        {/* Add product */}
         <div style={S.card}>
           <div style={S.cardTitle}>Add Product {isAdmin ? "(Admin)" : "(Admin only)"}</div>
 
@@ -238,7 +417,77 @@ export default function Products() {
           </div>
         </div>
 
-        {/* Table */}
+        <div style={{ ...S.card, marginTop: 14 }}>
+          <div style={S.cardTitle}>Product Categories</div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 220px 110px", gap: 10, marginTop: 12, alignItems: "end" }}>
+            <Field
+              label="New category name"
+              value={newCat.name}
+              onChange={(v) => setNewCat({ ...newCat, name: v })}
+              disabled={!isAdmin}
+              placeholder="e.g. Grocery"
+            />
+
+            <div>
+              <div style={S.label}>Color</div>
+              <input
+                type="color"
+                value={newCat.color}
+                disabled={!isAdmin}
+                onChange={(e) => setNewCat({ ...newCat, color: e.target.value })}
+                style={S.colorInput(!isAdmin)}
+              />
+            </div>
+
+            <div style={{ display: "flex", alignItems: "flex-end" }}>
+              <button
+                onClick={addCategory}
+                style={S.btnPrimary(!isAdmin || !canAddCat)}
+                disabled={!isAdmin || !canAddCat}
+              >
+                Add
+              </button>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 12, border: "1px solid var(--border)", borderRadius: 12, overflow: "hidden" }}>
+            <table style={S.table}>
+              <thead>
+                <tr>
+                  <th style={S.th}>Name</th>
+                  <th style={S.th}>Color</th>
+                  <th style={{ ...S.th, width: 220 }} />
+                </tr>
+              </thead>
+              <tbody>
+                {categories.map((c, idx) => (
+                  <tr key={c.id} style={{ background: idx % 2 ? "rgba(255,255,255,0.02)" : "transparent" }}>
+                    <td style={S.td}><b>{c.name}</b></td>
+                    <td style={S.td}>
+                      <span style={S.colorChipWrap}>
+                        <span style={{ ...S.colorDot, background: c.color || "#6366f1" }} />
+                        {c.color || "#6366f1"}
+                      </span>
+                    </td>
+                    <td style={{ ...S.td, textAlign: "right" }}>
+                      <button style={S.btnGhost()} onClick={() => openCategoryEdit(c)} disabled={!isAdmin}>Edit</button>
+                      <button style={{ ...S.btnDanger(), marginLeft: 8 }} onClick={() => deleteCategory(c)} disabled={!isAdmin}>Delete</button>
+                    </td>
+                  </tr>
+                ))}
+                {categories.length === 0 && (
+                  <tr>
+                    <td style={{ ...S.td, padding: 18, color: "var(--text2)" }} colSpan={3}>
+                      No categories found.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         <div style={{ ...S.card, marginTop: 14, padding: 0, overflow: "hidden" }}>
           <div style={{ padding: 14, borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div style={S.cardTitle}>Product List</div>
@@ -290,9 +539,9 @@ export default function Products() {
           </div>
         </div>
 
-        {/* Edit modal */}
         <Modal
           open={editOpen}
+          width={760}
           title="Edit product"
           onClose={() => { setEditOpen(false); setEdit(null); }}
         >
@@ -324,13 +573,54 @@ export default function Products() {
             </>
           )}
         </Modal>
+
+        <Modal
+          open={catEditOpen}
+          width={520}
+          title="Edit category"
+          onClose={() => { setCatEditOpen(false); setCatEdit(null); }}
+        >
+          {catEdit && (
+            <>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 180px", gap: 10 }}>
+                <Field label="Name" value={catEdit.name} onChange={(v) => setCatEdit({ ...catEdit, name: v })} />
+                <div>
+                  <div style={S.label}>Color</div>
+                  <input
+                    type="color"
+                    value={catEdit.color || "#6366f1"}
+                    onChange={(e) => setCatEdit({ ...catEdit, color: e.target.value })}
+                    style={S.colorInput(false)}
+                  />
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: 10, marginTop: 14, justifyContent: "flex-end" }}>
+                <button style={S.btnGhost()} onClick={() => { setCatEditOpen(false); setCatEdit(null); }}>Cancel</button>
+                <button style={S.btnPrimary(false)} onClick={saveCategoryEdit}>Save</button>
+              </div>
+            </>
+          )}
+        </Modal>
+
+        <ConfirmDialog
+          open={!!confirmState}
+          title={confirmState?.title}
+          message={confirmState?.message}
+          confirmText={confirmState?.confirmText}
+          busy={confirmBusy}
+          onCancel={() => {
+            if (confirmBusy) return;
+            setConfirmState(null);
+          }}
+          onConfirm={() => confirmState?.onConfirm?.()}
+        />
       </div>
     </div>
   );
 }
 
-// ---------- UI helpers ----------
-function Field({ label, value, onChange, disabled, type = "text" }) {
+function Field({ label, value, onChange, disabled, type = "text", placeholder }) {
   return (
     <div>
       <div style={S.label}>{label}</div>
@@ -340,16 +630,17 @@ function Field({ label, value, onChange, disabled, type = "text" }) {
         onChange={(e) => onChange(e.target.value)}
         style={S.input(disabled)}
         disabled={disabled}
+        placeholder={placeholder}
       />
     </div>
   );
 }
 
-function Modal({ open, title, children, onClose }) {
+function Modal({ open, title, children, onClose, width = 760 }) {
   if (!open) return null;
   return (
     <div style={S.overlay} onMouseDown={onClose}>
-      <div style={S.modal} onMouseDown={(e) => e.stopPropagation()}>
+      <div style={{ ...S.modal, width }} onMouseDown={(e) => e.stopPropagation()}>
         <div style={S.modalHeader}>
           <div style={{ fontWeight: 900, fontSize: 16 }}>{title}</div>
           <button style={S.btnGhost()} onClick={onClose}>Close</button>
@@ -416,6 +707,15 @@ const S = {
     opacity: disabled ? 0.65 : 1,
     fontWeight: 800,
   }),
+  colorInput: (disabled) => ({
+    width: "100%",
+    height: 42,
+    borderRadius: 12,
+    border: "1px solid var(--border)",
+    background: "transparent",
+    padding: 6,
+    opacity: disabled ? 0.65 : 1,
+  }),
 
   tableWrap: { overflow: "auto" },
   table: { width: "100%", borderCollapse: "separate", borderSpacing: 0 },
@@ -455,6 +755,19 @@ const S = {
     color: low ? "white" : "var(--text)",
   }),
 
+  colorChipWrap: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    fontWeight: 900,
+    color: "var(--text2)",
+  },
+  colorDot: {
+    width: 14,
+    height: 14,
+    borderRadius: 999,
+  },
+
   btnGhost: () => ({
     padding: "10px 12px",
     borderRadius: 12,
@@ -486,6 +799,6 @@ const S = {
   }),
 
   overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 },
-  modal: { width: 760, maxWidth: "94vw", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: 16, boxShadow: "var(--shadow)" },
+  modal: { maxWidth: "94vw", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: 16, boxShadow: "var(--shadow)" },
   modalHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 },
 };

@@ -3,23 +3,51 @@ import { usePOS } from "../App";
 
 const symMap = { BDT: "৳", USD: "$", GBP: "£", EUR: "€" };
 
+function formatFyDate(value) {
+  if (!value) return "";
+  const d = new Date(`${String(value).slice(0, 10)}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return String(value || "");
+  return d.toLocaleDateString("en-GB");
+}
+
 export default function Reports() {
   const { api, showToast } = usePOS();
   const [period, setPeriod] = useState("week");
   const [currency, setCurrency] = useState("BDT");
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [fyRows, setFyRows] = useState([]);
+  const [fy, setFy] = useState("");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
 
   const sym = symMap[currency] || "৳";
   const fmt = (n) => `${sym}${(Number(n) || 0).toFixed(2)}`;
 
+  const formatFyOptionLabel = (row) => {
+    if (!row) return "";
+    if (row.start_date && row.end_date) {
+      return `${row.label} • ${formatFyDate(row.start_date)} - ${formatFyDate(row.end_date)}`;
+    }
+    return row.label;
+  };
+
   const load = async () => {
     setLoading(true);
     try {
-      const s = await api.settings.getAll().catch(() => null);
-      if (s?.currency) setCurrency(String(s.currency).trim());
+      const [s, years, d] = await Promise.all([
+        api.settings.getAll().catch(() => null),
+        api.fiscalYears?.list?.().catch(() => []),
+        api.reports.summary({
+          period,
+          fiscal_year: fy,
+          from_date: fromDate,
+          to_date: toDate,
+        }),
+      ]);
 
-      const d = await api.reports.summary(period);
+      if (s?.currency) setCurrency(String(s.currency).trim());
+      setFyRows(Array.isArray(years) ? years : []);
       setData(d || null);
     } catch (e) {
       console.error(e);
@@ -32,13 +60,15 @@ export default function Reports() {
 
   useEffect(() => {
     load();
-  }, [period]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [period, fy, fromDate, toDate]);
 
   const periods = [
     { id: "today", label: "Today" },
     { id: "week", label: "7 Days" },
     { id: "month", label: "30 Days" },
     { id: "year", label: "Year" },
+    { id: "custom", label: "Custom" },
   ];
 
   const summary = data?.summary || {};
@@ -69,7 +99,7 @@ export default function Reports() {
 
   return (
     <div style={{ height: "100%", overflowY: "auto", padding: "20px 24px" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24, gap: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, gap: 12 }}>
         <h1 style={{ fontSize: 18, fontWeight: 700 }}>📊 Reports & Analytics</h1>
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
           {periods.map((p) => (
@@ -90,6 +120,99 @@ export default function Reports() {
               {p.label}
             </button>
           ))}
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1.5fr 1fr 1fr auto",
+          gap: 10,
+          marginBottom: 20,
+        }}
+      >
+        <div>
+          <div style={{ color: "var(--text3)", fontSize: 12, marginBottom: 6, fontWeight: 700 }}>Financial year</div>
+          <select
+            value={fy}
+            onChange={(e) => setFy(e.target.value)}
+            style={{
+              width: "100%",
+              padding: "11px 14px",
+              background: "var(--surface)",
+              border: "1px solid var(--border)",
+              borderRadius: 12,
+              color: "var(--text)",
+              fontSize: 13,
+            }}
+          >
+            <option value="">All financial years</option>
+            {fyRows.map((row) => (
+              <option key={`${row.label}-${row.start_date || ""}`} value={row.label}>
+                {formatFyOptionLabel(row)}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div>
+          <div style={{ color: "var(--text3)", fontSize: 12, marginBottom: 6, fontWeight: 700 }}>From date</div>
+          <input
+            type="date"
+            value={fromDate}
+            onChange={(e) => {
+              setFromDate(e.target.value);
+              setPeriod("custom");
+            }}
+            style={{
+              width: "100%",
+              padding: "11px 14px",
+              background: "var(--surface)",
+              border: "1px solid var(--border)",
+              borderRadius: 12,
+              color: "var(--text)",
+              fontSize: 13,
+            }}
+          />
+        </div>
+
+        <div>
+          <div style={{ color: "var(--text3)", fontSize: 12, marginBottom: 6, fontWeight: 700 }}>To date</div>
+          <input
+            type="date"
+            value={toDate}
+            onChange={(e) => {
+              setToDate(e.target.value);
+              setPeriod("custom");
+            }}
+            style={{
+              width: "100%",
+              padding: "11px 14px",
+              background: "var(--surface)",
+              border: "1px solid var(--border)",
+              borderRadius: 12,
+              color: "var(--text)",
+              fontSize: 13,
+            }}
+          />
+        </div>
+
+        <div style={{ display: "flex", alignItems: "end" }}>
+          <button
+            onClick={load}
+            style={{
+              padding: "11px 18px",
+              borderRadius: 12,
+              fontSize: 13,
+              fontWeight: 700,
+              background: "var(--surface)",
+              color: "var(--text)",
+              border: "1px solid var(--border)",
+              cursor: "pointer",
+            }}
+          >
+            Refresh
+          </button>
         </div>
       </div>
 
@@ -118,80 +241,70 @@ export default function Reports() {
                 const dayRevenue = Number(d.revenue || 0);
                 const h = Math.max(4, (dayRevenue / maxRevenue) * 140);
                 return (
-                  <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
-                    <div style={{ fontSize: 10, color: "var(--accent)", fontWeight: 700 }}>{fmt(dayRevenue).replace(sym, "")}</div>
+                  <div key={`${d.day}-${i}`} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end", height: "100%" }}>
+                    <div className="mono" style={{ marginBottom: 6, fontSize: 10, color: "var(--accent)", fontWeight: 700 }}>{dayRevenue.toFixed(2)}</div>
                     <div
                       style={{
                         width: "100%",
+                        maxWidth: 120,
                         height: h,
-                        background: "linear-gradient(180deg, var(--accent) 0%, rgba(108,99,255,0.3) 100%)",
-                        borderRadius: "4px 4px 0 0",
-                        position: "relative",
-                        cursor: "pointer",
-                        transition: "opacity 0.15s",
+                        borderRadius: "6px 6px 0 0",
+                        background: "linear-gradient(180deg, #6d5efc 0%, rgba(109,94,252,0.35) 100%)",
+                        border: "1px solid rgba(109,94,252,0.35)",
                       }}
-                      title={`${d.day}: ${fmt(dayRevenue)} (${Number(d.transactions || 0)} sales)`}
                     />
-                    <div style={{ fontSize: 9, color: "var(--text3)", textAlign: "center" }}>
-                      {new Date(`${d.day}T00:00:00`).toLocaleDateString([], { month: "short", day: "numeric" })}
-                    </div>
+                    <div style={{ marginTop: 8, fontSize: 11, color: "var(--text3)" }}>{d.day}</div>
                   </div>
                 );
               })}
             </div>
           ) : (
-            <div style={{ height: 160, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text3)" }}>No sales data for this period</div>
+            <div style={{ color: "var(--text3)", fontSize: 13 }}>No sales found for this selection.</div>
           )}
         </div>
 
         <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 }}>
           <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 16, color: "var(--text2)" }}>Top Products</h3>
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            {topProducts.length > 0 ? (
-              topProducts.map((p, i) => {
-                const maxRev = Number(topProducts[0]?.revenue || 1);
-                const revenueWidth = Math.max(0, (Number(p.revenue || 0) / maxRev) * 100);
+          {topProducts.length > 0 ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              {topProducts.map((p, i) => {
+                const maxTopRevenue = Math.max(...topProducts.map((x) => Number(x.revenue || 0)), 1);
+                const width = `${Math.max(10, (Number(p.revenue || 0) / maxTopRevenue) * 100)}%`;
                 return (
                   <div key={`${p.product_name}-${i}`}>
-                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4, gap: 8 }}>
-                      <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text)" }}>
-                        <span style={{ color: "var(--text3)", marginRight: 6 }}>#{i + 1}</span>
-                        {p.product_name}
-                      </span>
-                      <span className="mono" style={{ fontSize: 11, color: "var(--accent2)" }}>{fmt(p.revenue)}</span>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 6 }}>
+                      <div style={{ fontWeight: 700 }}>#{i + 1} {p.product_name}</div>
+                      <div className="mono" style={{ color: "var(--accent2)", fontWeight: 700 }}>{fmt(p.revenue)}</div>
                     </div>
-                    <div style={{ height: 4, background: "var(--surface2)", borderRadius: 2, overflow: "hidden" }}>
-                      <div style={{ height: "100%", width: `${revenueWidth}%`, background: "var(--accent)", borderRadius: 2 }} />
+                    <div style={{ height: 4, borderRadius: 999, background: "rgba(148,163,184,0.12)", overflow: "hidden" }}>
+                      <div style={{ width, height: "100%", background: "var(--accent)", borderRadius: 999 }} />
                     </div>
-                    <div style={{ fontSize: 11, color: "var(--text3)", marginTop: 2 }}>{Number(p.qty_sold || 0)} units sold</div>
+                    <div style={{ marginTop: 6, fontSize: 12, color: "var(--text3)" }}>{Number(p.qty_sold || 0)} units sold</div>
                   </div>
                 );
-              })
-            ) : (
-              <div style={{ color: "var(--text3)", fontSize: 13 }}>No sales in this period</div>
-            )}
-          </div>
+              })}
+            </div>
+          ) : (
+            <div style={{ color: "var(--text3)", fontSize: 13 }}>No product data in this range.</div>
+          )}
         </div>
       </div>
 
-      {lowStock.length > 0 && (
-        <div style={{ background: "rgba(244,63,94,0.08)", border: "1px solid rgba(244,63,94,0.25)", borderRadius: 14, padding: 20 }}>
-          <h3 style={{ fontSize: 14, fontWeight: 700, color: "var(--danger)", marginBottom: 14 }}>⚠️ Low Stock Alerts ({lowStock.length})</h3>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 10 }}>
+      <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 14, padding: 20 }}>
+        <h3 style={{ fontSize: 14, fontWeight: 700, marginBottom: 16, color: "var(--text2)" }}>Low Stock</h3>
+        {lowStock.length > 0 ? (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10 }}>
             {lowStock.map((p) => (
-              <div key={p.id} style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 10, padding: "12px 14px" }}>
-                <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>{p.name}</div>
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
-                  <span style={{ color: "var(--text3)" }}>Stock</span>
-                  <span style={{ color: Number(p.stock) === 0 ? "var(--danger)" : "var(--accent3)", fontWeight: 700 }}>
-                    {Number(p.stock || 0)} / min {Number(p.low_stock_threshold || 0)}
-                  </span>
-                </div>
+              <div key={p.id} style={{ border: "1px solid var(--border)", borderRadius: 12, padding: 12, background: "var(--surface2)" }}>
+                <div style={{ fontWeight: 700, marginBottom: 4 }}>{p.name}</div>
+                <div style={{ fontSize: 12, color: "var(--text3)" }}>Stock: {Number(p.stock || 0)} / Min: {Number(p.low_stock_threshold || 0)}</div>
               </div>
             ))}
           </div>
-        </div>
-      )}
+        ) : (
+          <div style={{ color: "var(--text3)", fontSize: 13 }}>No low-stock products right now.</div>
+        )}
+      </div>
     </div>
   );
 }

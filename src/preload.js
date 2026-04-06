@@ -111,6 +111,23 @@ contextBridge.exposeInMainWorld("pos", {
     addHistorical: (payload) => ipcRenderer.invoke("sales:addHistorical", payload),
   },
 
+  fiscalYears: {
+    list: () => ipcRenderer.invoke("fiscalYears:list"),
+    create: (payload) => ipcRenderer.invoke("fiscalYears:create", payload),
+    delete: (label) => ipcRenderer.invoke("fiscalYears:delete", label),
+  },
+
+  bankAccounts: {
+    list: () => ipcRenderer.invoke("bankAccounts:list"),
+    create: (payload) => ipcRenderer.invoke("bankAccounts:create", payload),
+    update: (payload) => ipcRenderer.invoke("bankAccounts:update", payload),
+    delete: (id) => ipcRenderer.invoke("bankAccounts:delete", id),
+    transactions: (accountId) => ipcRenderer.invoke("bankAccounts:transactions", accountId),
+    createTransaction: (payload) => ipcRenderer.invoke("bankAccounts:createTransaction", payload),
+    updateTransaction: (payload) => ipcRenderer.invoke("bankAccounts:updateTransaction", payload),
+    deleteTransaction: (id) => ipcRenderer.invoke("bankAccounts:deleteTransaction", id),
+  },
+
   // Reports
   reports: {
     // supports summary("today") or summary({ period: "today" })
@@ -133,7 +150,15 @@ contextBridge.exposeInMainWorld("pos", {
     test: () => ipcRenderer.invoke("sync:test"),
     pushInventory: () => ipcRenderer.invoke("sync:pushInventory"),
     pullProducts: () => ipcRenderer.invoke("sync:pullProducts"),
+    pullBank: () => ipcRenderer.invoke("sync:pullBank"),
     pushProducts: () => ipcRenderer.invoke("sync:pushProducts"),
+    pushAll: () => ipcRenderer.invoke("sync:pushAll"),
+  },
+
+  managerChanges: {
+    listPending: () => ipcRenderer.invoke("managerChanges:listPending"),
+    accept: (payload) => ipcRenderer.invoke("managerChanges:accept", payload),
+    reject: (payload) => ipcRenderer.invoke("managerChanges:reject", payload),
   },
 
   // Receipt (PDF save + email)

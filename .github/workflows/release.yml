@@ -46,7 +46,7 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run build:mac -- --publish never
+      - run: npm run build:mac:universal -- --publish never
 
       - name: Upload Mac Release Assets
         uses: softprops/action-gh-release@v2

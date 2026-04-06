@@ -14,7 +14,10 @@
     "build": "vite build && electron-builder",
     "build:mac": "vite build && electron-builder --mac",
     "build:win": "vite build && electron-builder --win",
-    "postinstall": "electron-builder install-app-deps"
+    "postinstall": "electron-builder install-app-deps",
+    "build:mac:x64": "vite build && electron-builder --mac --x64",
+    "build:mac:arm64": "vite build && electron-builder --mac --arm64",
+    "build:mac:universal": "vite build && electron-builder --mac --universal"
   },
   "build": {
     "appId": "com.sajib.retailpos",
@@ -29,8 +32,18 @@
     "artifactName": "RetailPOS-Setup-${version}.${ext}",
     "mac": {
       "target": [
-        "dmg",
-        "zip"
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "universal"
+          ]
+        }
       ],
       "category": "public.app-category.finance"
     },

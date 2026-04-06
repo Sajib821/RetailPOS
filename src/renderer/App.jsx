@@ -17,6 +17,8 @@ import Customers from "./pages/Customers";
 import Users from "./pages/Users";
 import SalesHistory from "./pages/SalesHistory";
 import CustomerAccounts from "./pages/CustomerAccounts";
+import BankAccounts from "./pages/BankAccounts";
+import ManagerChangeReview from "./components/ManagerChangeReview";
 
 export const POSContext = createContext(null);
 export const usePOS = () => useContext(POSContext);
@@ -91,6 +93,15 @@ function createMockAPI() {
       store_1: [],
       store_2: [],
     },
+    fiscalYearsByStore: {
+      store_1: [],
+      store_2: [],
+    },
+    bankAccountsByStore: {
+      store_1: [],
+      store_2: [],
+    },
+    bankTransactionsByAccount: {},
     me: null,
   };
 
@@ -105,6 +116,8 @@ function createMockAPI() {
     if (!mock.customersByStore[sid]) mock.customersByStore[sid] = [];
     if (!mock.salesByStore[sid]) mock.salesByStore[sid] = [];
     if (!mock.customerPaymentsByStore[sid]) mock.customerPaymentsByStore[sid] = [];
+    if (!mock.fiscalYearsByStore[sid]) mock.fiscalYearsByStore[sid] = [];
+    if (!mock.bankAccountsByStore[sid]) mock.bankAccountsByStore[sid] = [];
   };
 
   const setActiveStore = (storeObj) => {
@@ -168,6 +181,37 @@ function createMockAPI() {
     return mock.customerPaymentsByStore[sid];
   };
 
+
+  const getBankAccounts = (sid = currentStoreId()) => {
+    ensureStore(sid);
+    return mock.bankAccountsByStore[sid];
+  };
+
+  const getBankTransactions = (accountId) => {
+    const key = String(accountId || "");
+    if (!mock.bankTransactionsByAccount[key]) mock.bankTransactionsByAccount[key] = [];
+    return mock.bankTransactionsByAccount[key];
+  };
+
+  const summarizeBankAccount = (account) => {
+    const opening = Number(account?.opening_balance || 0);
+    const txs = getBankTransactions(account?.id);
+    const totalCredit = txs
+      .filter((row) => row.type === "credit")
+      .reduce((sum, row) => sum + Number(row.amount || 0), 0);
+    const totalDebit = txs
+      .filter((row) => row.type === "debit")
+      .reduce((sum, row) => sum + Number(row.amount || 0), 0);
+
+    return {
+      ...account,
+      opening_balance: opening,
+      total_credit: totalCredit,
+      total_debit: totalDebit,
+      current_balance: opening + totalCredit - totalDebit,
+    };
+  };
+
   const parseDateLoose = (s) => {
     if (!s) return new Date();
     if (typeof s !== "string") return new Date(s);
@@ -184,6 +228,110 @@ function createMockAPI() {
 
   const nowFiscalYear = () => {
     return fiscalYearFromDate(new Date(), Number(mockSettings.fy_start_month || 7) || 7);
+  };
+
+  const normYmd = (v) => {
+    const raw = String(v || '').trim();
+    if (!raw) return '';
+    const d = new Date(raw.includes('T') ? raw : `${raw}T00:00:00`);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toISOString().slice(0, 10);
+  };
+
+  const inferFiscalYearDates = (label, startMonth = 7) => {
+    const m = String(label || '').trim().match(/^(\d{4})-(\d{4})$/);
+    if (!m) return { start_date: '', end_date: '' };
+
+    const startYear = Number(m[1]);
+    const endYear = Number(m[2]);
+    const start = new Date(Date.UTC(startYear, Math.max(0, Number(startMonth || 7) - 1), 1));
+    const end = new Date(Date.UTC(endYear, Math.max(0, Number(startMonth || 7) - 1), 0));
+
+    return {
+      start_date: start.toISOString().slice(0, 10),
+      end_date: end.toISOString().slice(0, 10),
+    };
+  };
+
+  const parseSalePaymentJson = (sale) => {
+    try {
+      const raw = sale?.payment_json;
+      if (!raw) return {};
+      if (typeof raw === 'string') return JSON.parse(raw);
+      if (typeof raw === 'object' && raw !== null) return raw;
+      return {};
+    } catch {
+      return {};
+    }
+  };
+
+  const getSalePaidAmount = (sale) => {
+    if ((sale?.sale_type || 'sale') === 'refund') return 0;
+
+    const total = Number(sale?.total || 0);
+    const payment = parseSalePaymentJson(sale);
+
+    const paidFromJson = Number(payment?.paidTotal);
+    if (Number.isFinite(paidFromJson) && paidFromJson > 0) {
+      return Math.min(total, Math.max(0, paidFromJson));
+    }
+
+    const status = String(sale?.status || '').toLowerCase();
+    if (status === 'completed') return total;
+
+    return 0;
+  };
+
+  const listFiscalYearsForStore = (sid = currentStoreId()) => {
+    ensureStore(sid);
+
+    const byLabel = new Map();
+    (mock.fiscalYearsByStore[sid] || []).forEach((row) => {
+      const label = String(row.label || '').trim();
+      if (!label) return;
+      byLabel.set(label, { ...row, inferred: 0 });
+    });
+
+    const labels = new Set();
+    getSales(sid).forEach((s) => {
+      if (String(s.fiscal_year || '').trim()) labels.add(String(s.fiscal_year || '').trim());
+    });
+    getPayments(sid).forEach((p) => {
+      if (String(p.fiscal_year || '').trim()) labels.add(String(p.fiscal_year || '').trim());
+    });
+
+    labels.forEach((label) => {
+      if (byLabel.has(label)) return;
+      const inferred = inferFiscalYearDates(label, Number(mockSettings.fy_start_month || 7) || 7);
+      byLabel.set(label, {
+        id: null,
+        label,
+        start_date: inferred.start_date,
+        end_date: inferred.end_date,
+        created_at: null,
+        inferred: 1,
+      });
+    });
+
+    return Array.from(byLabel.values()).sort((a, b) => {
+      const aDate = String(a.start_date || '');
+      const bDate = String(b.start_date || '');
+      if (aDate && bDate && aDate !== bDate) return aDate < bDate ? 1 : -1;
+      return String(a.label || '') < String(b.label || '') ? 1 : -1;
+    });
+  };
+
+  const inCustomRange = (value, fromDate, toDate) => {
+    const ts = new Date(value).getTime();
+    if (Number.isNaN(ts)) return false;
+
+    const start = normYmd(fromDate);
+    const end = normYmd(toDate || fromDate);
+    if (!start || !end) return true;
+
+    const startTs = new Date(`${start}T00:00:00`).getTime();
+    const endTs = new Date(`${end}T23:59:59`).getTime();
+    return ts >= startTs && ts <= endTs;
   };
 
   const computeCustomerDueByYear = (storeId, customerId) => {
@@ -219,7 +367,10 @@ function createMockAPI() {
 
       const row = addYear(fy);
       if ((s.sale_type || "sale") === "refund") row.refunds += Number(s.total || 0);
-      else row.credit_sales += Number(s.total || 0);
+      else {
+        row.credit_sales += Number(s.total || 0);
+        row.payments += Number(getSalePaidAmount(s) || 0);
+      }
     });
 
     payments.forEach((p) => {
@@ -550,6 +701,39 @@ function createMockAPI() {
       },
     },
 
+    fiscalYears: {
+      list: async () => listFiscalYearsForStore(currentStoreId()).map((x) => ({ ...x })),
+      create: async ({ label, start_date, end_date } = {}) => {
+        const cleanLabel = String(label || '').trim();
+        const start = normYmd(start_date);
+        const end = normYmd(end_date);
+        if (!cleanLabel || !start || !end) return { ok: false, message: 'Label, start date, and end date are required' };
+        if (start > end) return { ok: false, message: 'Start date must be before end date' };
+
+        ensureStore(currentStoreId());
+        const rows = mock.fiscalYearsByStore[currentStoreId()];
+        if (rows.some((r) => String(r.label || '').trim() === cleanLabel)) {
+          return { ok: false, message: 'Financial year label already exists' };
+        }
+
+        rows.unshift({
+          id: id(),
+          label: cleanLabel,
+          start_date: start,
+          end_date: end,
+          created_at: new Date().toISOString(),
+        });
+        return { ok: true };
+      },
+      delete: async (label) => {
+        ensureStore(currentStoreId());
+        mock.fiscalYearsByStore[currentStoreId()] = (mock.fiscalYearsByStore[currentStoreId()] || []).filter(
+          (r) => String(r.label || '').trim() !== String(label || '').trim()
+        );
+        return { ok: true };
+      },
+    },
+
     customers: {
       getAll: async () => getCustomers().map((c) => ({ ...c })),
 
@@ -622,19 +806,22 @@ function createMockAPI() {
         return { ok: true, customer: { ...customer }, ...due };
       },
 
-      history: async ({ customer_id, range, fiscal_year } = {}) => {
+      history: async ({ customer_id, range, fiscal_year, from_date, to_date } = {}) => {
         const sales = getSales()
           .filter((s) => Number(s.customer_id) === Number(customer_id))
           .filter((s) => {
-            if (range === "fy" && fiscal_year) return String(s.fiscal_year || "") === String(fiscal_year);
+            if (fiscal_year && String(s.fiscal_year || "") !== String(fiscal_year)) return false;
             if (range === "today") {
               return new Date(s.created_at).toDateString() === new Date().toDateString();
             }
             if (range === "7d") {
-              return new Date(s.created_at).getTime() >= Date.now() - 7 * 24 * 60 * 60 * 1000;
+              return new Date(s.created_at).getTime() >= Date.now() - 6 * 24 * 60 * 60 * 1000;
             }
             if (range === "month") {
-              return new Date(s.created_at).getTime() >= Date.now() - 30 * 24 * 60 * 60 * 1000;
+              return new Date(s.created_at).getTime() >= Date.now() - 29 * 24 * 60 * 60 * 1000;
+            }
+            if (range === "custom") {
+              return inCustomRange(s.created_at, from_date, to_date);
             }
             return true;
           })
@@ -643,15 +830,18 @@ function createMockAPI() {
         const payments = getPayments()
           .filter((p) => Number(p.customer_id) === Number(customer_id))
           .filter((p) => {
-            if (range === "fy" && fiscal_year) return String(p.fiscal_year || "") === String(fiscal_year);
+            if (fiscal_year && String(p.fiscal_year || "") !== String(fiscal_year)) return false;
             if (range === "today") {
               return new Date(p.created_at).toDateString() === new Date().toDateString();
             }
             if (range === "7d") {
-              return new Date(p.created_at).getTime() >= Date.now() - 7 * 24 * 60 * 60 * 1000;
+              return new Date(p.created_at).getTime() >= Date.now() - 6 * 24 * 60 * 60 * 1000;
             }
             if (range === "month") {
-              return new Date(p.created_at).getTime() >= Date.now() - 30 * 24 * 60 * 60 * 1000;
+              return new Date(p.created_at).getTime() >= Date.now() - 29 * 24 * 60 * 60 * 1000;
+            }
+            if (range === "custom") {
+              return inCustomRange(p.created_at, from_date, to_date);
             }
             return true;
           })
@@ -931,19 +1121,140 @@ function createMockAPI() {
       },
     },
 
+    bankAccounts: {
+      list: async () => {
+        return getBankAccounts()
+          .map((row) => summarizeBankAccount({ ...row }))
+          .sort((a, b) => String(a.account_name || "").localeCompare(String(b.account_name || "")));
+      },
+
+      create: async ({ account_name, bank_name, account_number, opening_balance, note } = {}) => {
+        const row = {
+          id: id(),
+          store_id: currentStoreId(),
+          account_name: String(account_name || "").trim(),
+          bank_name: String(bank_name || "").trim(),
+          account_number: String(account_number || "").trim(),
+          opening_balance: Number(opening_balance || 0),
+          note: String(note || "").trim(),
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+
+        if (!row.account_name) return { ok: false, message: "Account name required" };
+
+        getBankAccounts().unshift(row);
+        mock.bankTransactionsByAccount[String(row.id)] = [];
+        return { ok: true, id: row.id };
+      },
+
+      update: async ({ id: accountId, account_name, bank_name, account_number, opening_balance, note } = {}) => {
+        const rows = getBankAccounts();
+        const idx = rows.findIndex((row) => Number(row.id) === Number(accountId));
+        if (idx < 0) return { ok: false, message: "Bank account not found" };
+
+        rows[idx] = {
+          ...rows[idx],
+          account_name: String(account_name || "").trim(),
+          bank_name: String(bank_name || "").trim(),
+          account_number: String(account_number || "").trim(),
+          opening_balance: Number(opening_balance || 0),
+          note: String(note || "").trim(),
+          updated_at: new Date().toISOString(),
+        };
+
+        if (!rows[idx].account_name) return { ok: false, message: "Account name required" };
+        return { ok: true };
+      },
+
+      delete: async (accountId) => {
+        mock.bankAccountsByStore[currentStoreId()] = getBankAccounts().filter(
+          (row) => Number(row.id) !== Number(accountId)
+        );
+        delete mock.bankTransactionsByAccount[String(accountId)];
+        return { ok: true };
+      },
+
+      transactions: async (accountId) => {
+        return getBankTransactions(accountId)
+          .slice()
+          .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
+          .map((row) => ({ ...row }));
+      },
+
+      createTransaction: async ({ account_id, type, amount, note, reference, created_at } = {}) => {
+        const account = getBankAccounts().find((row) => Number(row.id) === Number(account_id));
+        if (!account) return { ok: false, message: "Bank account not found" };
+
+        const row = {
+          id: id(),
+          store_id: currentStoreId(),
+          account_id: Number(account_id),
+          type: type === "debit" ? "debit" : "credit",
+          amount: Number(amount || 0),
+          note: String(note || "").trim(),
+          reference: String(reference || "").trim(),
+          created_at: created_at || new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+
+        if (row.amount <= 0) return { ok: false, message: "Amount must be greater than zero" };
+
+        getBankTransactions(account_id).unshift(row);
+        return { ok: true, id: row.id };
+      },
+
+      updateTransaction: async ({ id: entryId, account_id, type, amount, note, reference, created_at } = {}) => {
+        const rows = getBankTransactions(account_id);
+        const idx = rows.findIndex((row) => Number(row.id) === Number(entryId));
+        if (idx < 0) return { ok: false, message: "Transaction not found" };
+
+        rows[idx] = {
+          ...rows[idx],
+          type: type === "debit" ? "debit" : "credit",
+          amount: Number(amount || 0),
+          note: String(note || "").trim(),
+          reference: String(reference || "").trim(),
+          created_at: created_at || rows[idx].created_at,
+          updated_at: new Date().toISOString(),
+        };
+
+        if (rows[idx].amount <= 0) return { ok: false, message: "Amount must be greater than zero" };
+        return { ok: true };
+      },
+
+      deleteTransaction: async (entryId) => {
+        const account = getBankAccounts().find((row) =>
+          getBankTransactions(row.id).some((tx) => Number(tx.id) === Number(entryId))
+        );
+
+        if (!account) return { ok: false, message: "Transaction not found" };
+
+        mock.bankTransactionsByAccount[String(account.id)] = getBankTransactions(account.id).filter(
+          (row) => Number(row.id) !== Number(entryId)
+        );
+        return { ok: true };
+      },
+    },
+
     reports: {
       summary: async (arg = {}) => {
         const period = typeof arg === "string" ? arg : arg?.period || "today";
-        const rows = getSales();
+        const fiscalYear = String(arg?.fiscal_year || "").trim();
+        const fromDate = arg?.from_date;
+        const toDate = arg?.to_date;
+        const rows = getSales().filter((s) => ["completed", "due"].includes(String(s.status || "").toLowerCase()));
 
         const filtered = rows.filter((s) => {
           const created = new Date(s.created_at).getTime();
           const now = Date.now();
 
+          if (fiscalYear && String(s.fiscal_year || "") !== fiscalYear) return false;
           if (period === "today") return new Date(s.created_at).toDateString() === new Date().toDateString();
-          if (period === "week") return created >= now - 7 * 24 * 60 * 60 * 1000;
-          if (period === "month") return created >= now - 30 * 24 * 60 * 60 * 1000;
-          if (period === "year") return created >= now - 365 * 24 * 60 * 60 * 1000;
+          if (period === "week") return created >= now - 6 * 24 * 60 * 60 * 1000;
+          if (period === "month") return created >= now - 29 * 24 * 60 * 60 * 1000;
+          if (period === "year" && !fiscalYear) return created >= now - 365 * 24 * 60 * 60 * 1000;
+          if (period === "custom") return inCustomRange(s.created_at, fromDate, toDate);
           return true;
         });
 
@@ -955,6 +1266,30 @@ function createMockAPI() {
           .filter((s) => s.sale_type === "refund")
           .reduce((a, s) => a + Number(s.total || 0), 0);
 
+        const byDayMap = new Map();
+        filtered.forEach((s) => {
+          const key = String(s.created_at || '').slice(0, 10);
+          const row = byDayMap.get(key) || { day: key, revenue: 0, refunds: 0, profit: 0, transactions: 0 };
+          if ((s.sale_type || 'sale') === 'refund') row.refunds += Number(s.total || 0);
+          else row.revenue += Number(s.total || 0);
+          row.profit += Number(s.gross_profit || 0);
+          row.transactions += 1;
+          byDayMap.set(key, row);
+        });
+
+        const itemMap = new Map();
+        filtered.forEach((s) => {
+          const items = mock.saleItemsBySaleId[s.id] || [];
+          items.forEach((it) => {
+            const key = `${it.product_id || it.product_name}`;
+            const row = itemMap.get(key) || { product_name: it.product_name, qty_sold: 0, revenue: 0, profit: 0 };
+            row.qty_sold += Number(it.quantity || 0);
+            row.revenue += Number(it.subtotal || 0);
+            row.profit += Number(it.profit || 0);
+            itemMap.set(key, row);
+          });
+        });
+
         return {
           summary: {
             transactions: filtered.length,
@@ -962,8 +1297,8 @@ function createMockAPI() {
             refunds,
             gross_profit: filtered.reduce((a, s) => a + Number(s.gross_profit || 0), 0),
           },
-          topProducts: [],
-          byDay: [],
+          topProducts: Array.from(itemMap.values()).sort((a, b) => Number(b.revenue || 0) - Number(a.revenue || 0)).slice(0, 10),
+          byDay: Array.from(byDayMap.values()).sort((a, b) => String(a.day).localeCompare(String(b.day))),
           lowStock: getProducts().filter(
             (p) => Number(p.stock || 0) <= Number(p.low_stock_threshold || 5)
           ),
@@ -976,6 +1311,7 @@ function createMockAPI() {
       pullProducts: async () => ({ ok: true, counts: { products: 0, categories: 0 } }),
       pushProducts: async () => ({ ok: true }),
       pushInventory: async () => true,
+      pushAll: async () => ({ ok: true }),
     },
 
     receipt: {
@@ -994,6 +1330,7 @@ const NAV = [
   { id: "customers", label: "Customers", icon: "👥" },
   { id: "accounts", label: "Accounts", icon: "💳" },
   { id: "users", label: "Users", icon: "👤" },
+  { id: "banking", label: "Bank", icon: "🏦", adminOnly: true },
   { id: "settings", label: "Settings", icon: "⚙️", adminOnly: true },
 ];
 
@@ -1135,6 +1472,7 @@ export default function App() {
       sales: SalesHistory,
       customers: Customers,
       accounts: CustomerAccounts,
+      banking: BankAccounts,
       users: Users,
       settings: Settings,
     }),
@@ -1423,6 +1761,9 @@ export default function App() {
           <PageComponent />
         </main>
       </div>
+
+      <ManagerChangeReview api={api} me={me} store={store} showToast={showToast} />
+
 
       {toast && (
         <div
