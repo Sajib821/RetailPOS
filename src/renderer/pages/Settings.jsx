@@ -104,6 +104,10 @@ export default function Settings() {
   const [newFYLabel, setNewFYLabel] = useState(`${new Date().getFullYear()}-${new Date().getFullYear() + 1}`);
   const [newFYStartDate, setNewFYStartDate] = useState("");
   const [newFYEndDate, setNewFYEndDate] = useState("");
+  const [editingFYOriginalLabel, setEditingFYOriginalLabel] = useState("");
+  const [editingFYLabel, setEditingFYLabel] = useState("");
+  const [editingFYStartDate, setEditingFYStartDate] = useState("");
+  const [editingFYEndDate, setEditingFYEndDate] = useState("");
   const [confirmState, setConfirmState] = useState(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
 
@@ -194,6 +198,55 @@ export default function Settings() {
     }
   }
 
+
+  async function refreshFinancialYears() {
+    const years = await api.fiscalYears?.list?.().catch(() => []);
+    setFyRows(Array.isArray(years) ? years : []);
+  }
+
+  function resetFinancialYearEditor() {
+    setEditingFYOriginalLabel("");
+    setEditingFYLabel("");
+    setEditingFYStartDate("");
+    setEditingFYEndDate("");
+  }
+
+  function startEditFinancialYear(row) {
+    setEditingFYOriginalLabel(String(row?.label || "").trim());
+    setEditingFYLabel(String(row?.label || "").trim());
+    setEditingFYStartDate(String(row?.start_date || "").slice(0, 10));
+    setEditingFYEndDate(String(row?.end_date || "").slice(0, 10));
+  }
+
+  async function saveFinancialYearEdit(row) {
+    if (!isAdmin) return showToast("Admin only", "error");
+
+    const originalLabel = String(editingFYOriginalLabel || row?.label || "").trim();
+    const nextLabel = String(editingFYLabel || "").trim();
+    const start = String(editingFYStartDate || "").trim();
+    const end = String(editingFYEndDate || "").trim();
+
+    if (!originalLabel || !nextLabel || !start || !end) {
+      return showToast("Enter label, start date, and end date", "warning");
+    }
+
+    const res = await api.fiscalYears.update({
+      original_label: originalLabel,
+      label: nextLabel,
+      start_date: start,
+      end_date: end,
+      allow_inferred_create: row?.inferred && originalLabel === nextLabel ? 1 : 0,
+    });
+
+    if (res?.ok === false) {
+      return showToast(res.message || "Failed to update financial year", "error");
+    }
+
+    showToast(`Financial year ${nextLabel} updated ✅`);
+    resetFinancialYearEditor();
+    await refreshFinancialYears();
+  }
+
   async function testSupabase() {
     try {
       const ok = await api.sync.test();
@@ -236,6 +289,23 @@ export default function Settings() {
     }
   }
 
+
+
+  async function restoreFromCloud() {
+    if (!isAdmin) return showToast("Admin only", "error");
+    try {
+      const res = await api.sync.restoreFromCloud({ force: true });
+      const ok = !!(res?.ok ?? res);
+      showToast(ok ? "Cloud restore completed ✅" : (res?.message || "Cloud restore failed ❌"), ok ? "success" : "error");
+      if (ok) {
+        await loadAll();
+      }
+    } catch (e) {
+      console.error(e);
+      showToast(e?.message || "Cloud restore failed", "error");
+    }
+  }
+
   async function createFinancialYear() {
     if (!isAdmin) return showToast("Admin only", "error");
 
@@ -261,9 +331,9 @@ export default function Settings() {
     setNewFYLabel(`${new Date().getFullYear()}-${new Date().getFullYear() + 1}`);
     setNewFYStartDate("");
     setNewFYEndDate("");
+    resetFinancialYearEditor();
 
-    const years = await api.fiscalYears?.list?.().catch(() => []);
-    setFyRows(Array.isArray(years) ? years : []);
+    await refreshFinancialYears();
   }
 
   async function performDeleteFinancialYear(row) {
@@ -275,8 +345,10 @@ export default function Settings() {
       }
 
       showToast(`Financial year ${row.label} deleted`, "warning");
-      const years = await api.fiscalYears?.list?.().catch(() => []);
-      setFyRows(Array.isArray(years) ? years : []);
+      if (String(editingFYOriginalLabel || "") === String(row.label || "")) {
+        resetFinancialYearEditor();
+      }
+      await refreshFinancialYears();
       setConfirmState(null);
     } finally {
       setConfirmBusy(false);
@@ -426,13 +498,13 @@ export default function Settings() {
           <div style={cardTitle()}>Financial years</div>
 
           <div style={{ marginTop: 10, color: "var(--text3)", fontSize: 12, lineHeight: 1.5 }}>
-            Create and manage financial year labels here so Customer Accounts stays cleaner.
+            Create / save financial years with manual start and end dates. You can also edit existing financial year dates here.
           </div>
 
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "1.2fr 1fr 1fr 220px",
+              gridTemplateColumns: "1.2fr 1fr 1fr 260px",
               gap: 10,
               marginTop: 12,
               alignItems: "end",
@@ -498,30 +570,96 @@ export default function Settings() {
                     </td>
                   </tr>
                 ) : (
-                  fyRows.map((row, idx) => (
-                    <tr
-                      key={`${row.label}-${row.start_date || ""}-${idx}`}
-                      style={{
-                        borderTop: "1px solid rgba(255,255,255,0.06)",
-                        background: idx % 2 ? "rgba(255,255,255,0.02)" : "transparent",
-                      }}
-                    >
-                      <td style={td()}><b>{row.label}</b></td>
-                      <td style={td()}>{formatFyDate(row.start_date)}</td>
-                      <td style={td()}>{formatFyDate(row.end_date)}</td>
-                      <td style={td()}>{row.inferred ? "Inferred" : "Manual"}</td>
-                      <td style={{ ...td(), textAlign: "right" }}>
-                        <button
-                          onClick={() => deleteFinancialYear(row)}
-                          style={btnDanger()}
-                          disabled={!isAdmin || !!row.inferred}
-                          title={row.inferred ? "Inferred financial years cannot be deleted until related records are updated" : "Delete financial year"}
-                        >
-                          Delete
-                        </button>
-                      </td>
-                    </tr>
-                  ))
+                  fyRows.map((row, idx) => {
+                    const isEditing = String(editingFYOriginalLabel || "") === String(row.label || "");
+                    return (
+                      <tr
+                        key={`${row.label}-${row.start_date || ""}-${idx}`}
+                        style={{
+                          borderTop: "1px solid rgba(255,255,255,0.06)",
+                          background: idx % 2 ? "rgba(255,255,255,0.02)" : "transparent",
+                        }}
+                      >
+                        <td style={td()}>
+                          {isEditing ? (
+                            <input
+                              value={editingFYLabel}
+                              onChange={(e) => setEditingFYLabel(e.target.value)}
+                              disabled={!isAdmin || !!row.inferred}
+                              style={inputStyle(!isAdmin || !!row.inferred)}
+                            />
+                          ) : (
+                            <b>{row.label}</b>
+                          )}
+                        </td>
+                        <td style={td()}>
+                          {isEditing ? (
+                            <input
+                              type="date"
+                              value={editingFYStartDate}
+                              onChange={(e) => setEditingFYStartDate(e.target.value)}
+                              disabled={!isAdmin}
+                              style={inputStyle(!isAdmin)}
+                            />
+                          ) : (
+                            formatFyDate(row.start_date)
+                          )}
+                        </td>
+                        <td style={td()}>
+                          {isEditing ? (
+                            <input
+                              type="date"
+                              value={editingFYEndDate}
+                              onChange={(e) => setEditingFYEndDate(e.target.value)}
+                              disabled={!isAdmin}
+                              style={inputStyle(!isAdmin)}
+                            />
+                          ) : (
+                            formatFyDate(row.end_date)
+                          )}
+                        </td>
+                        <td style={td()}>{row.inferred ? "Inferred" : "Manual"}</td>
+                        <td style={{ ...td(), textAlign: "right" }}>
+                          <div style={{ display: "inline-flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                            {isEditing ? (
+                              <>
+                                <button
+                                  onClick={() => saveFinancialYearEdit(row)}
+                                  style={btnPrimary(!isAdmin)}
+                                  disabled={!isAdmin}
+                                >
+                                  Save
+                                </button>
+                                <button
+                                  onClick={resetFinancialYearEditor}
+                                  style={btnGhost()}
+                                >
+                                  Cancel
+                                </button>
+                              </>
+                            ) : (
+                              <button
+                                onClick={() => startEditFinancialYear(row)}
+                                style={btnGhost()}
+                                disabled={!isAdmin}
+                                title={row.inferred ? "You can edit dates for inferred years. To change the label, update related records first." : "Edit financial year"}
+                              >
+                                Edit
+                              </button>
+                            )}
+                            <button
+                              onClick={() => deleteFinancialYear(row)}
+                              style={btnDanger()}
+                              disabled={!isAdmin || !!row.inferred}
+                              title={row.inferred ? "Inferred financial years cannot be deleted until related records are updated" : "Delete financial year"}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
@@ -574,10 +712,13 @@ export default function Settings() {
             <button onClick={pushAllCloud} style={btnGhost()} disabled={!isAdmin}>
               Push all data
             </button>
+            <button onClick={restoreFromCloud} style={btnGhost()} disabled={!isAdmin}>
+              Restore from cloud
+            </button>
           </div>
 
           <div style={{ marginTop: 10, color: "var(--text3)", fontSize: 12, lineHeight: 1.5 }}>
-            Automatic cloud sync covers sales, refunds, inventory, product/category changes, customers, customer payments, financial years, bank accounts, and bank transactions. Use <b>Push all data</b> once after first connection or after changing the Supabase schema.
+            Automatic cloud sync covers sales, refunds, inventory, product/category changes, customers, customer payments, financial years, bank accounts, and bank transactions. Use <b>Push all data</b> once after first connection or after changing the Supabase schema. Use <b>Restore from cloud</b> on a new / empty PC to pull store data down from Supabase into the local desktop database.
           </div>
         </div>
 

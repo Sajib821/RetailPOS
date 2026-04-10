@@ -530,13 +530,123 @@ function getSettingsObject() {
   return Object.fromEntries(rows.map((r) => [r.key, r.value]));
 }
 
+function getBootstrapDefaults() {
+  const envStoreId = String(
+    process.env.POS_DEFAULT_STORE_ID ||
+    process.env.DEFAULT_STORE_ID ||
+    process.env.STORE_ID ||
+    ""
+  ).trim();
+  const envStoreName = String(
+    process.env.POS_DEFAULT_STORE_NAME ||
+    process.env.DEFAULT_STORE_NAME ||
+    process.env.STORE_NAME ||
+    ""
+  ).trim();
+  const envCurrency = String(
+    process.env.POS_DEFAULT_CURRENCY ||
+    process.env.DEFAULT_CURRENCY ||
+    process.env.CURRENCY ||
+    "BDT"
+  ).trim() || "BDT";
+  const envFyStartMonth = Number(
+    process.env.POS_FY_START_MONTH ||
+    process.env.DEFAULT_FY_START_MONTH ||
+    7
+  ) || 7;
+
+  let row = null;
+  try {
+    const hasStoresTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='stores'")
+      .get();
+
+    if (hasStoresTable) {
+      if (envStoreId) {
+        row = db.prepare("SELECT * FROM stores WHERE store_id=?").get(envStoreId) || null;
+      }
+      if (!row) {
+        row = db.prepare("SELECT * FROM stores ORDER BY created_at ASC, store_id ASC LIMIT 1").get() || null;
+      }
+    }
+  } catch {
+    row = null;
+  }
+
+  return {
+    store_id: String(row?.store_id || envStoreId || "").trim(),
+    store_name: String(row?.store_name || envStoreName || row?.store_id || "RetailPOS").trim() || "RetailPOS",
+    currency: String(row?.currency || envCurrency || "BDT").trim() || "BDT",
+    fy_start_month: Number(row?.fy_start_month || envFyStartMonth || 7) || 7,
+  };
+}
+
+function getSyncDefaults() {
+  const s = getSettingsObject();
+  return {
+    supabase_url: String(
+      s.supabase_url ||
+      process.env.POS_SUPABASE_URL ||
+      process.env.SUPABASE_URL ||
+      process.env.VITE_SUPABASE_URL ||
+      ""
+    ).trim(),
+    supabase_key: String(
+      s.supabase_key ||
+      process.env.POS_SUPABASE_KEY ||
+      process.env.SUPABASE_KEY ||
+      process.env.VITE_SUPABASE_ANON_KEY ||
+      ""
+    ).trim(),
+  };
+}
+
+function getSuperadminPinHash() {
+  const s = getSettingsObject();
+  const envPinHash = String(
+    process.env.POS_SUPERADMIN_PIN_HASH ||
+    process.env.SUPERADMIN_PIN_HASH ||
+    ""
+  ).trim();
+  const envPin = String(
+    process.env.POS_SUPERADMIN_PIN ||
+    process.env.SUPERADMIN_PIN ||
+    ""
+  ).trim();
+
+  return (
+    String(s.superadmin_pin_hash || "").trim() ||
+    envPinHash ||
+    (envPin ? sha256(envPin) : sha256("1111"))
+  );
+}
+
+function applyStoreAsPrimary(storeId) {
+  const sid = String(storeId || "").trim();
+  if (!sid) return;
+
+  const row = getStoreRow(sid);
+  if (!row) {
+    db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("store_id", sid);
+    refreshStoreCtxFromSettings();
+    return;
+  }
+
+  db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("store_id", sid);
+  db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("store_name", String(row.store_name || sid));
+  db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("currency", String(row.currency || "BDT"));
+  db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("fy_start_month", String(Number(row.fy_start_month || 7) || 7));
+  refreshStoreCtxFromSettings();
+}
+
 function refreshStoreCtxFromSettings() {
   const s = getSettingsObject();
+  const fallback = getBootstrapDefaults();
   storeCtx = {
-    store_id: (s.store_id || "store_1").trim(),
-    store_name: (s.store_name || "Store 1").trim(),
-    currency: (s.currency || "BDT").trim(),
-    fy_start_month: Number(s.fy_start_month || 7) || 7,
+    store_id: String(s.store_id || fallback.store_id || "").trim(),
+    store_name: String(s.store_name || fallback.store_name || fallback.store_id || "RetailPOS").trim() || "RetailPOS",
+    currency: String(s.currency || fallback.currency || "BDT").trim() || "BDT",
+    fy_start_month: Number(s.fy_start_month || fallback.fy_start_month || 7) || 7,
   };
 }
 
@@ -563,18 +673,327 @@ function getEffectiveSettingsObject() {
 }
 
 // ---------- sync init ----------
+let restoreInFlight = false;
+
+function shouldAttemptCloudRestore(storeId) {
+  const sid = String(storeId || "").trim();
+  if (!sid) return false;
+
+  const counts = {
+    products: Number(db.prepare("SELECT COUNT(*) AS c FROM products WHERE store_id=?").get(sid)?.c || 0),
+    categories: Number(db.prepare("SELECT COUNT(*) AS c FROM categories WHERE store_id=?").get(sid)?.c || 0),
+    customers: Number(db.prepare("SELECT COUNT(*) AS c FROM customers WHERE store_id=?").get(sid)?.c || 0),
+    customerPayments: Number(db.prepare("SELECT COUNT(*) AS c FROM customer_payments WHERE store_id=?").get(sid)?.c || 0),
+    fiscalYears: Number(db.prepare("SELECT COUNT(*) AS c FROM fiscal_years WHERE store_id=?").get(sid)?.c || 0),
+    bankAccounts: Number(db.prepare("SELECT COUNT(*) AS c FROM bank_accounts WHERE store_id=?").get(sid)?.c || 0),
+    bankTransactions: Number(db.prepare("SELECT COUNT(*) AS c FROM bank_transactions WHERE store_id=?").get(sid)?.c || 0),
+    sales: Number(db.prepare("SELECT COUNT(*) AS c FROM sales WHERE store_id=?").get(sid)?.c || 0),
+  };
+
+  return Object.values(counts).every((n) => !n);
+}
+
+function applyPulledStoreMetaToLocal(store = {}, storeId = null) {
+  const sid = String(store?.store_id || storeId || "").trim();
+  if (!sid) return;
+
+  const storeName = String(store?.store_name || sid).trim() || sid;
+  const currency = String(store?.currency || "BDT").trim() || "BDT";
+  const fyStart = Number(store?.fy_start_month || 7) || 7;
+  const contact = store?.contact == null ? "" : String(store.contact);
+  const receiptFooter = store?.receipt_footer == null ? "Thank you for shopping with us!" : String(store.receipt_footer);
+
+  db.prepare(`
+    INSERT INTO stores (store_id, store_name, currency, contact, receipt_footer, fy_start_month, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
+    ON CONFLICT(store_id) DO UPDATE SET
+      store_name=excluded.store_name,
+      currency=excluded.currency,
+      contact=excluded.contact,
+      receipt_footer=excluded.receipt_footer,
+      fy_start_month=excluded.fy_start_month
+  `).run(
+    sid,
+    storeName,
+    currency,
+    contact,
+    receiptFooter,
+    fyStart,
+    store?.created_at || null
+  );
+
+  db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("store_id", sid);
+  db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("store_name", storeName);
+  db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("currency", currency);
+  db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("fy_start_month", String(fyStart));
+  db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("contact", contact);
+  db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("receipt_footer", receiptFooter);
+  refreshStoreCtxFromSettings();
+}
+
+function applyPulledCatalogToLocal({ storeId, categories = [], products = [], inventory = [] } = {}) {
+  const sid = String(storeId || "").trim();
+  if (!sid) return { categories: 0, products: 0 };
+
+  const inventoryByProductId = new Map(
+    (inventory || []).map((row) => [String(row?.product_id), row]).filter(([k]) => !!k)
+  );
+
+  const run = db.transaction(() => {
+    db.prepare("DELETE FROM categories WHERE store_id=?").run(sid);
+    db.prepare("DELETE FROM products WHERE store_id=?").run(sid);
+
+    const insertCategory = db.prepare(`
+      INSERT INTO categories (id, store_id, name, color)
+      VALUES (?, ?, ?, ?)
+    `);
+
+    (categories || [])
+      .map((row) => ({
+        id: Number(row?.local_id),
+        name: String(row?.name || "").trim(),
+        color: String(row?.color || "#6366f1").trim() || "#6366f1",
+      }))
+      .filter((row) => row.id && row.name)
+      .sort((a, b) => a.id - b.id)
+      .forEach((row) => {
+        insertCategory.run(row.id, sid, row.name, row.color);
+      });
+
+    const insertProduct = db.prepare(`
+      INSERT INTO products (
+        id, store_id, name, sku, category, price, cost, stock, low_stock_threshold, barcode, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), COALESCE(?, datetime('now')))
+    `);
+
+    (products || [])
+      .map((row) => {
+        const inv = inventoryByProductId.get(String(row?.local_id)) || {};
+        return {
+          id: Number(row?.local_id),
+          name: String(row?.name || "").trim(),
+          sku: row?.sku == null ? "" : String(row.sku),
+          category: row?.category == null ? "" : String(row.category),
+          price: Number(row?.price || 0),
+          cost: Number(row?.cost || 0),
+          stock: Number(inv?.stock || 0),
+          low_stock_threshold: Number(inv?.low_stock_threshold || row?.low_stock_threshold || 5) || 5,
+          barcode: row?.barcode == null ? "" : String(row.barcode),
+          created_at: row?.created_at || inv?.created_at || null,
+          updated_at: row?.updated_at || inv?.updated_at || null,
+        };
+      })
+      .filter((row) => row.id && row.name)
+      .sort((a, b) => a.id - b.id)
+      .forEach((row) => {
+        insertProduct.run(
+          row.id,
+          sid,
+          row.name,
+          row.sku,
+          row.category,
+          row.price,
+          row.cost,
+          row.stock,
+          row.low_stock_threshold,
+          row.barcode,
+          row.created_at,
+          row.updated_at
+        );
+      });
+  });
+
+  run();
+  return { categories: Array.isArray(categories) ? categories.length : 0, products: Array.isArray(products) ? products.length : 0 };
+}
+
+function applyPulledCustomersToLocal({ storeId, customers = [] } = {}) {
+  const sid = String(storeId || "").trim();
+  if (!sid) return { customers: 0 };
+
+  const run = db.transaction(() => {
+    db.prepare("DELETE FROM customers WHERE store_id=?").run(sid);
+    const ins = db.prepare(`
+      INSERT INTO customers (id, store_id, name, phone, email, address, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), COALESCE(?, datetime('now')))
+    `);
+
+    (customers || [])
+      .map((row) => ({
+        id: Number(row?.local_id),
+        name: String(row?.name || "").trim(),
+        phone: row?.phone == null ? null : String(row.phone),
+        email: row?.email == null ? null : String(row.email),
+        address: row?.address == null ? null : String(row.address),
+        created_at: row?.created_at || null,
+        updated_at: row?.updated_at || null,
+      }))
+      .filter((row) => row.id && row.name)
+      .sort((a, b) => a.id - b.id)
+      .forEach((row) => {
+        ins.run(row.id, sid, row.name, row.phone, row.email, row.address, row.created_at, row.updated_at);
+      });
+  });
+
+  run();
+  return { customers: Array.isArray(customers) ? customers.length : 0 };
+}
+
+function applyPulledCustomerPaymentsToLocal({ storeId, customerPayments = [] } = {}) {
+  const sid = String(storeId || "").trim();
+  if (!sid) return { customerPayments: 0 };
+
+  const run = db.transaction(() => {
+    db.prepare("DELETE FROM customer_payments WHERE store_id=?").run(sid);
+    const ins = db.prepare(`
+      INSERT INTO customer_payments (
+        id, store_id, customer_id, fiscal_year, amount, method, note, created_at, cashier_id, cashier_name
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?, ?)
+    `);
+
+    (customerPayments || [])
+      .map((row) => ({
+        id: Number(row?.local_id),
+        customer_id: row?.local_customer_id == null ? null : Number(row.local_customer_id),
+        fiscal_year: row?.fiscal_year == null ? "" : String(row.fiscal_year),
+        amount: Number(row?.amount || 0),
+        method: row?.method == null ? "cash" : String(row.method),
+        note: row?.note == null ? "" : String(row.note),
+        created_at: row?.created_at || null,
+        cashier_id: row?.cashier_id == null ? null : Number(row.cashier_id),
+        cashier_name: row?.cashier_name == null ? null : String(row.cashier_name),
+      }))
+      .filter((row) => row.id && row.amount > 0)
+      .sort((a, b) => a.id - b.id)
+      .forEach((row) => {
+        ins.run(row.id, sid, row.customer_id, row.fiscal_year, row.amount, row.method, row.note, row.created_at, row.cashier_id, row.cashier_name);
+      });
+  });
+
+  run();
+  return { customerPayments: Array.isArray(customerPayments) ? customerPayments.length : 0 };
+}
+
+function applyPulledFiscalYearsToLocal({ storeId, fiscalYears = [] } = {}) {
+  const sid = String(storeId || "").trim();
+  if (!sid) return { fiscalYears: 0 };
+
+  const run = db.transaction(() => {
+    db.prepare("DELETE FROM fiscal_years WHERE store_id=?").run(sid);
+    const ins = db.prepare(`
+      INSERT INTO fiscal_years (id, store_id, label, start_date, end_date, created_at)
+      VALUES (?, ?, ?, ?, ?, COALESCE(?, datetime('now')))
+    `);
+
+    (fiscalYears || [])
+      .map((row) => ({
+        id: row?.local_id == null ? null : Number(row.local_id),
+        label: String(row?.label || "").trim(),
+        start_date: normYmd(row?.start_date),
+        end_date: normYmd(row?.end_date),
+        created_at: row?.created_at || null,
+      }))
+      .filter((row) => row.label && row.start_date && row.end_date)
+      .sort((a, b) => String(a.start_date).localeCompare(String(b.start_date)))
+      .forEach((row, idx) => {
+        ins.run(row.id || (idx + 1), sid, row.label, row.start_date, row.end_date, row.created_at);
+      });
+  });
+
+  run();
+  return { fiscalYears: Array.isArray(fiscalYears) ? fiscalYears.length : 0 };
+}
+
+async function triggerFirstRunCloudRestore(storeId = effectiveStoreId(), { force = false } = {}) {
+  const sid = String(storeId || effectiveStoreId() || "").trim();
+  if (!sid) return { ok: false, message: "No store selected" };
+  if (!sync?.pullStoreSnapshot) return { ok: false, message: "Cloud restore not available" };
+  if (restoreInFlight) return { ok: false, message: "Cloud restore already running" };
+  if (!force && !shouldAttemptCloudRestore(sid)) {
+    return { ok: false, message: "Local store already has data. Use force restore only on a new/empty PC." };
+  }
+
+  restoreInFlight = true;
+  try {
+    const snapshot = await sync.pullStoreSnapshot({ storeId: sid });
+    applyPulledStoreMetaToLocal(snapshot?.store || {}, sid);
+    const catalogCounts = applyPulledCatalogToLocal({
+      storeId: sid,
+      categories: snapshot?.categories || [],
+      products: snapshot?.products || [],
+      inventory: snapshot?.inventory || [],
+    });
+    const customerCounts = applyPulledCustomersToLocal({ storeId: sid, customers: snapshot?.customers || [] });
+    const paymentCounts = applyPulledCustomerPaymentsToLocal({ storeId: sid, customerPayments: snapshot?.customerPayments || [] });
+    const fyCounts = applyPulledFiscalYearsToLocal({ storeId: sid, fiscalYears: snapshot?.fiscalYears || [] });
+    applyPulledBankDataToLocal({
+      storeId: sid,
+      accounts: snapshot?.bankAccounts || [],
+      transactions: snapshot?.bankTransactions || [],
+    });
+
+    const admin = db.prepare("SELECT id FROM users WHERE store_id=? AND lower(username)='admin'").get(sid);
+    if (!admin) {
+      db.prepare(`
+        INSERT INTO users (store_id, username, name, role, pin_hash)
+        VALUES (?,?,?,?,?)
+      `).run(sid, "admin", "Admin", "admin", sha256("1234"));
+    }
+
+    currentUser = null;
+    initSyncFromSettings();
+
+    return {
+      ok: true,
+      counts: {
+        categories: catalogCounts.categories,
+        products: catalogCounts.products,
+        customers: customerCounts.customers,
+        customerPayments: paymentCounts.customerPayments,
+        fiscalYears: fyCounts.fiscalYears,
+        bankAccounts: Array.isArray(snapshot?.bankAccounts) ? snapshot.bankAccounts.length : 0,
+        bankTransactions: Array.isArray(snapshot?.bankTransactions) ? snapshot.bankTransactions.length : 0,
+      },
+    };
+  } catch (e) {
+    return { ok: false, message: e?.message || "Cloud restore failed" };
+  } finally {
+    restoreInFlight = false;
+  }
+}
+
 function initSyncFromSettings() {
   try {
     const s = getSettingsObject();
-    const supabaseUrl = (s.supabase_url || "").trim();
-    const supabaseKey = (s.supabase_key || "").trim();
-    const storeId = (s.store_id || "").trim();
-    const storeName = (s.store_name || "").trim();
+    const syncDefaults = getSyncDefaults();
+    const supabaseUrl = (s.supabase_url || syncDefaults.supabase_url || "").trim();
+    const supabaseKey = (s.supabase_key || syncDefaults.supabase_key || "").trim();
+    const storeId = String(s.store_id || getBootstrapDefaults().store_id || "").trim();
+    const storeName = String(s.store_name || getBootstrapDefaults().store_name || "").trim();
 
     if (!supabaseUrl || !supabaseKey || !storeId) return;
     if (!sync || typeof sync.init !== "function") return;
 
+    if ((s.supabase_url || "") !== supabaseUrl) {
+      db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("supabase_url", supabaseUrl);
+    }
+    if ((s.supabase_key || "") !== supabaseKey) {
+      db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("supabase_key", supabaseKey);
+    }
+    if ((s.store_id || "") !== storeId) {
+      db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("store_id", storeId);
+    }
+    if ((s.store_name || "") !== storeName && storeName) {
+      db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run("store_name", storeName);
+    }
+    refreshStoreCtxFromSettings();
+
     sync.init({ supabaseUrl, supabaseKey, storeId, storeName });
+
+    if (shouldAttemptCloudRestore(storeId)) {
+      Promise.resolve(triggerFirstRunCloudRestore(storeId, { force: true })).catch(() => {});
+      return;
+    }
 
     Promise.resolve(triggerStoreMetaSync(storeId)).catch(() => {});
     const products = db.prepare("SELECT * FROM products WHERE store_id=?").all(storeId);
@@ -1021,8 +1440,8 @@ function initDB() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 
-    INSERT OR IGNORE INTO settings VALUES ('store_name', 'Store 1');
-    INSERT OR IGNORE INTO settings VALUES ('store_id', 'store_1');
+    INSERT OR IGNORE INTO settings VALUES ('store_name', '');
+    INSERT OR IGNORE INTO settings VALUES ('store_id', '');
     INSERT OR IGNORE INTO settings VALUES ('currency', 'BDT');
     INSERT OR IGNORE INTO settings VALUES ('fy_start_month', '7');
     INSERT OR IGNORE INTO settings VALUES ('receipt_footer', 'Thank you for shopping with us!');
@@ -1439,7 +1858,7 @@ function registerIpcHandlers() {
 
     if (username && username.toLowerCase() === "superadmin") {
       const s = getSettingsObject();
-      const hash = s.superadmin_pin_hash || sha256("1111");
+      const hash = getSuperadminPinHash();
 
       if (sha256(pin) !== hash) {
         return { ok: false, message: "Invalid Superadmin PIN" };
@@ -1541,7 +1960,7 @@ function registerIpcHandlers() {
 
     if (isSuperadmin()) {
       const s = getSettingsObject();
-      const hash = s.superadmin_pin_hash || sha256("1111");
+      const hash = getSuperadminPinHash();
       if (sha256(oldP) !== hash) return { ok: false, message: "Old Superadmin PIN incorrect" };
 
       db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES ('superadmin_pin_hash',?)")
@@ -1712,6 +2131,67 @@ function registerIpcHandlers() {
         INSERT INTO fiscal_years (store_id, label, start_date, end_date)
         VALUES (?, ?, ?, ?)
       `).run(sid, label, start_date, end_date);
+      return { ok: true };
+    } catch {
+      return { ok: false, message: 'Financial year label already exists' };
+    }
+  });
+
+  safeHandle("fiscalYears:update", (_, payload = {}) => {
+    if (!isAdmin()) return adminOnly();
+
+    const sid = effectiveStoreId();
+    const original_label = String(payload.original_label || payload.label || '').trim();
+    const next_label = String(payload.label || '').trim();
+    const start_date = normYmd(payload.start_date);
+    const end_date = normYmd(payload.end_date);
+    const allow_inferred_create = Number(payload.allow_inferred_create || 0) ? 1 : 0;
+
+    if (!original_label || !next_label || !start_date || !end_date) {
+      return { ok: false, message: 'Label, start date, and end date are required' };
+    }
+
+    if (start_date > end_date) {
+      return { ok: false, message: 'Start date must be before end date' };
+    }
+
+    const existing = db.prepare(`
+      SELECT id, label
+      FROM fiscal_years
+      WHERE store_id=? AND label=?
+    `).get(sid, original_label);
+
+    const duplicate = db.prepare(`
+      SELECT id
+      FROM fiscal_years
+      WHERE store_id=? AND label=?
+    `).get(sid, next_label);
+
+    if (existing) {
+      if (duplicate && Number(duplicate.id) !== Number(existing.id)) {
+        return { ok: false, message: 'Financial year label already exists' };
+      }
+
+      db.prepare(`
+        UPDATE fiscal_years
+        SET label=?, start_date=?, end_date=?
+        WHERE store_id=? AND label=?
+      `).run(next_label, start_date, end_date, sid, original_label);
+
+      Promise.resolve(triggerFiscalYearsSync(sid)).catch(() => {});
+      return { ok: true };
+    }
+
+    if (!allow_inferred_create) {
+      return { ok: false, message: 'Only manual financial years can change label. For inferred years, keep the same label and save dates.' };
+    }
+
+    try {
+      db.prepare(`
+        INSERT INTO fiscal_years (store_id, label, start_date, end_date)
+        VALUES (?, ?, ?, ?)
+      `).run(sid, next_label, start_date, end_date);
+      Promise.resolve(triggerFiscalYearsSync(sid)).catch(() => {});
       return { ok: true };
     } catch {
       return { ok: false, message: 'Financial year label already exists' };

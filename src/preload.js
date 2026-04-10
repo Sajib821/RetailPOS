@@ -151,6 +151,7 @@ contextBridge.exposeInMainWorld("pos", {
     pushInventory: () => ipcRenderer.invoke("sync:pushInventory"),
     pullProducts: () => ipcRenderer.invoke("sync:pullProducts"),
     pullBank: () => ipcRenderer.invoke("sync:pullBank"),
+    restoreFromCloud: (payload) => ipcRenderer.invoke("sync:restoreFromCloud", payload || {}),
     pushProducts: () => ipcRenderer.invoke("sync:pushProducts"),
     pushAll: () => ipcRenderer.invoke("sync:pushAll"),
   },

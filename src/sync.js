@@ -265,6 +265,110 @@ async function pullSharedCatalog({ storeId } = {}) {
 }
 
 
+async function pullStoreRow({ storeId } = {}) {
+  if (!enabled) return null;
+  const s = resolveStoreId(storeId);
+  const table = await resolveTable("stores");
+  const { data, error } = await supabase
+    .from(table)
+    .select("*")
+    .eq("store_id", s)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return data || null;
+}
+
+async function pullInventoryData({ storeId } = {}) {
+  if (!enabled) return [];
+  const s = resolveStoreId(storeId);
+  const table = await resolveTable("inventory");
+  const { data, error } = await supabase
+    .from(table)
+    .select("*")
+    .eq("store_id", s)
+    .order("product_id", { ascending: true });
+  if (error) throw new Error(error.message);
+  return Array.isArray(data) ? data : [];
+}
+
+async function pullCustomersData({ storeId } = {}) {
+  if (!enabled) return [];
+  const s = resolveStoreId(storeId);
+  const table = await resolveTable("customers");
+  const { data, error } = await supabase
+    .from(table)
+    .select("*")
+    .eq("store_id", s)
+    .order("local_id", { ascending: true });
+  if (error) throw new Error(error.message);
+  return Array.isArray(data) ? data : [];
+}
+
+async function pullCustomerPaymentsData({ storeId } = {}) {
+  if (!enabled) return [];
+  const s = resolveStoreId(storeId);
+  const table = await resolveTable("customerPayments");
+  const { data, error } = await supabase
+    .from(table)
+    .select("*")
+    .eq("store_id", s)
+    .order("local_id", { ascending: true });
+  if (error) throw new Error(error.message);
+  return Array.isArray(data) ? data : [];
+}
+
+async function pullFiscalYearsData({ storeId } = {}) {
+  if (!enabled) return [];
+  const s = resolveStoreId(storeId);
+  const table = await resolveTable("fiscalYears");
+  const { data, error } = await supabase
+    .from(table)
+    .select("*")
+    .eq("store_id", s)
+    .order("start_date", { ascending: true });
+  if (error) throw new Error(error.message);
+  return Array.isArray(data) ? data : [];
+}
+
+async function pullStoreSnapshot({ storeId } = {}) {
+  if (!enabled) {
+    return {
+      store: null,
+      categories: [],
+      products: [],
+      inventory: [],
+      customers: [],
+      customerPayments: [],
+      fiscalYears: [],
+      bankAccounts: [],
+      bankTransactions: [],
+    };
+  }
+
+  const [store, catalog, inventory, customers, customerPayments, fiscalYears, bank] = await Promise.all([
+    pullStoreRow({ storeId }),
+    pullSharedCatalog({ storeId }),
+    pullInventoryData({ storeId }),
+    pullCustomersData({ storeId }),
+    pullCustomerPaymentsData({ storeId }),
+    pullFiscalYearsData({ storeId }),
+    pullBankData({ storeId }),
+  ]);
+
+  return {
+    store: store || null,
+    categories: Array.isArray(catalog?.categories) ? catalog.categories : [],
+    products: Array.isArray(catalog?.products) ? catalog.products : [],
+    inventory: Array.isArray(inventory) ? inventory : [],
+    customers: Array.isArray(customers) ? customers : [],
+    customerPayments: Array.isArray(customerPayments) ? customerPayments : [],
+    fiscalYears: Array.isArray(fiscalYears) ? fiscalYears : [],
+    bankAccounts: Array.isArray(bank?.accounts) ? bank.accounts : [],
+    bankTransactions: Array.isArray(bank?.transactions) ? bank.transactions : [],
+  };
+}
+
+
 async function listPendingManagerChanges({ storeId, status = "pending" } = {}) {
   if (!enabled) return [];
   const s = resolveStoreId(storeId);
@@ -688,6 +792,12 @@ module.exports = {
   syncStore,
   pushSharedCatalog,
   pullSharedCatalog,
+  pullStoreRow,
+  pullInventoryData,
+  pullCustomersData,
+  pullCustomerPaymentsData,
+  pullFiscalYearsData,
+  pullStoreSnapshot,
   syncInventory,
   syncCustomers,
   syncCustomerPayments,
